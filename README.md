@@ -18,19 +18,24 @@
 
 ### 1. 运行识别命令
 
-在项目根目录执行正式高精度识别：
+1. 在项目根目录执行正式高精度识别：
 
 ```bash
 uv run main.py --input "./证件模板" --db "./data/ocr.db"
 ```
 
-如需手动开发联调、启用次高精度快速推理（使用 `PP-OCRv4 Mobile` 识别模型，单图速度更快，默认写入独立测试库 `./data/ocr_fast.db`）：
+2. 如需手动开发联调、启用次高精度快速推理（使用 `PP-OCRv4 Mobile` 识别模型，单图速度更快，默认写入独立测试库 `./data/ocr_fast.db`）：
 
 ```bash
 uv run main.py --input "./证件模板/set1" --fast
 ```
 
 > 快速模式禁止写入正式默认数据库 `./data/ocr.db`，避免快速档产生的成功记录导致后续正式识别跳过相同文件。
+
+3. 进行数据库导出
+```bash
+ uv run main.py -export --db "./data/ocr_fast.db"
+```
 
 ### 2. 命令行参数说明
 
