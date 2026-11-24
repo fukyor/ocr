@@ -2,7 +2,7 @@
 字段提取模块
 
 依据特种作业操作证正面卡内两个局部区域（人像右侧、卡片底部）的无量纲相对几何关系，
-定位并提取固定七个字段。所有几何判定均基于文字框实际行高自适应缩放，不依赖绝对像素坐标。
+定位并提取固定九个字段。所有几何判定均基于文字框实际行高自适应缩放，不依赖绝对像素坐标。
 """
 import re
 from dataclasses import dataclass
@@ -14,6 +14,7 @@ from config import (
     AUX_LABEL_ALIASES,
     FIELD_LABEL_ALIASES,
     VALID_UNTIL_EXACT_LABELS,
+    VALIDITY_SLOT_KEY,
 )
 from models import FieldDict, TextBlock, create_empty_fields
 
@@ -61,7 +62,7 @@ _ORG_SUFFIXES: Tuple[str, ...] = (
 
 # 区域槽位定义
 _UPPER_SLOTS: Dict[str, Tuple[int, int]] = {
-    "证号": (0, 0),  # 辅助定位，位于人像右侧第一行左栏上方
+    "证号": (0, 0),  # 正式输出字段，位于人像右侧最顶部通栏
     "姓名": (1, 0),
     "作业类别": (1, 1),
     "性别": (2, 0),
@@ -70,7 +71,7 @@ _UPPER_SLOTS: Dict[str, Tuple[int, int]] = {
 
 _BOTTOM_SLOTS: Dict[str, Tuple[int, int]] = {
     "初领日期": (1, 0),
-    "有效期截止日期": (1, 1),
+    VALIDITY_SLOT_KEY: (1, 1),  # 逻辑槽位，解析后产出"有效期开始日期"与"有效期截止日期"两个独立字段
     "应复审日期": (2, 0),
     "签发机关": (2, 1),
 }
@@ -141,7 +142,7 @@ def _parse_single_date(text: str) -> Optional[str]:
     compact = re.sub(r"\s+", "", text)
     if not compact:
         return None
-    # 若明显包含区间关键词或类似“至/到”连接两个日期片段，拒绝作为单日期
+    # 若明显包含区间关键词或类似"至/到"连接两个日期片段，拒绝作为单日期
     if "至" in compact or "到" in compact:
         return None
 
@@ -150,7 +151,7 @@ def _parse_single_date(text: str) -> Optional[str]:
         return None
 
     m = matches[0]
-    # 拒绝在日期之外混杂过多无关长文本（允许尾部如 "前" 等极短字符前先剔除？初领日期不应含“前”）
+    # 拒绝在日期之外混杂过多无关长文本（允许尾部如 "前" 等极短字符前先剔除？初领日期不应含"前"）
     rem = (compact[: m.start()] + compact[m.end() :]).strip()
     if rem:
         return None
@@ -182,6 +183,144 @@ def _parse_date_range(text: str) -> Optional[Tuple[str, str]]:
     if end_iso < start_iso:
         return None
     return start_iso, end_iso
+
+
+def _validate_cert_no_labeled(raw_text: Optional[str]) -> Optional[str]:
+    """
+    校验有"证号"标签时的文本编号。
+
+    规则：去空白后，要求严格由 ASCII 字母与数字组成（6~32位）、
+    至少包含 4 位数字、非噪声词、非纯日期格式，原样保留所有字母和前导零。
+    """
+    if raw_text is None:
+        return None
+
+    compact = re.sub(r"\s+", "", raw_text)
+    if not compact:
+        return None
+
+    # 长度检查
+    if len(compact) < 6 or len(compact) > 32:
+        return None
+
+    # 仅允许 ASCII 字母与数字
+    if not re.match(r"^[A-Za-z0-9]+$", compact):
+        return None
+
+    # 至少包含 4 位数字
+    digit_count = sum(1 for c in compact if c.isdigit())
+    if digit_count < 4:
+        return None
+
+    # 排除噪声关键词
+    if any(kw in compact for kw in _NOISE_KEYWORDS):
+        return None
+
+    # 排除纯日期格式（如 20220829、2022-08-29 去空白后）
+    if re.match(r"^\d{8}$", compact) or re.match(r"^\d{4}[-./年]\d{1,2}[-./月]\d{1,2}日?$", raw_text):
+        return None
+
+    return compact
+
+
+def _split_by_single_range_separator(text: str) -> Optional[Tuple[str, str]]:
+    """
+    按单个明确区间连接符分割文本。
+
+    优先分割：至、到、~、～、—、–、--
+    次选：完整日期之外的单个 - 连字符
+
+    返回 (左侧文本, 右侧文本) 或 None（无分隔符或有多个分隔符）
+    """
+    # 优先按明确区间连接符分割
+    primary_seps = [r"至", r"到", r"[~～—–]", r"--"]
+    for sep_pattern in primary_seps:
+        parts = re.split(sep_pattern, text)
+        if len(parts) == 2:
+            return (parts[0].strip(), parts[1].strip())
+        elif len(parts) > 2:
+            # 多个相同分隔符，无法明确分割
+            return None
+
+    # 次选：检查是否为"完整日期 - 非日期"或"非日期 - 完整日期"形态
+    # 要求 - 严格位于完整日期匹配之外，不误拆日期内部的 YYYY-MM-DD
+    date_matches = list(_SINGLE_DATE_RE.finditer(text))
+
+    if len(date_matches) == 1:
+        match = date_matches[0]
+        before = text[:match.start()]
+        after = text[match.end():]
+
+        # 形态1：残缺 - 完整日期
+        if before.rstrip().endswith("-") and not after.lstrip().startswith("-"):
+            left = before.rstrip()[:-1].strip()
+            right = text[match.start():].strip()
+            return (left, right)
+
+        # 形态2：完整日期 - 残缺
+        if after.lstrip().startswith("-") and not before.rstrip().endswith("-"):
+            left = text[:match.end()].strip()
+            right = after.lstrip()[1:].strip()
+            return (left, right)
+
+    return None
+
+
+def _parse_validity_endpoints(
+    raw_text: str,
+    matched_alias: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    独立解析有效期起始日期与截止日期（已确认存在有效期限/有效期/有效期至标签）。
+
+    返回 (有效期开始日期, 有效期截止日期)，任一无法确定时为 None。
+
+    规则：
+    1. 若出现 >=3 个日期片段，立即判为跨栏污染返回 (None, None)
+    2. 尝试完整双日期区间（start <= end）
+    3. 尝试单区间连接符分割后两端独立解析
+    4. 若无区间分隔符且标签为"有效期至"，单日期可认定为止日
+    5. 若两端均合法但逻辑倒置（end < start），返回 (None, None)
+    """
+    compact = re.sub(r"\s+", "", raw_text)
+    if not compact:
+        return (None, None)
+
+    # 1. 跨栏多日期污染守卫
+    all_date_matches = _SINGLE_DATE_RE.findall(compact)
+    if len(all_date_matches) >= 3:
+        return (None, None)
+
+    # 2. 尝试完整双日期区间
+    full_range = _parse_date_range(compact)
+    if full_range is not None:
+        start_date, end_date = full_range
+        # 若两日期均合法但逻辑倒置，拒绝
+        if end_date < start_date:
+            return (None, None)
+        return (start_date, end_date)
+
+    # 3. 尝试单区间连接符分割
+    split_res = _split_by_single_range_separator(compact)
+    if split_res is not None:
+        left_raw, right_raw = split_res
+        start_iso = _parse_single_date(left_raw) if left_raw else None
+        end_iso = _parse_single_date(right_raw) if right_raw else None
+
+        # 若两端均合法但逻辑倒置，双端拒绝
+        if start_iso is not None and end_iso is not None:
+            if end_iso < start_iso:
+                return (None, None)
+
+        return (start_iso, end_iso)
+
+    # 4. 无区间分隔符：仅"有效期至"标签可直接认定单止日
+    if matched_alias in VALID_UNTIL_EXACT_LABELS:
+        single_iso = _parse_single_date(compact)
+        return (None, single_iso) if single_iso is not None else (None, None)
+
+    # 5. 普通"有效期限/有效期"标签下仅有单日期且无分隔符 -> 归属不明
+    return (None, None)
 
 
 def _union_bbox(blocks: Sequence[TextBlock], text: str = "") -> TextBlock:
@@ -232,8 +371,8 @@ def _ref_height(anchors: Sequence[_RegionAnchor]) -> float:
 class FieldExtractor:
     """特种作业操作证字段提取器。"""
 
-    def __init__(self) -> None:
-        # 汇总所有已知标签别名，按别名长度降序排列以优先匹配更精确的长标签（如“有效期至”优先于“有效期”）
+    def __init__(self, enable_patches: bool = True) -> None:
+        # 汇总所有已知标签别名，按别名长度降序排列以优先匹配更精确的长标签（如"有效期至"优先于"有效期"）
         alias_pairs: List[Tuple[str, str]] = []
         for field_key, aliases in FIELD_LABEL_ALIASES.items():
             for alias in aliases:
@@ -247,6 +386,7 @@ class FieldExtractor:
         self._exact_alias_map: Dict[str, str] = {
             alias: key for alias, key in alias_pairs
         }
+        self._enable_patches = enable_patches
 
     def extract_fields(
         self,
@@ -324,6 +464,14 @@ class FieldExtractor:
                 fields=fields,
             )
 
+        # 6. 应用补丁（仅当存在缺失字段时触发）
+        if (
+            self._enable_patches
+            and (fields["签发机关"] is None or fields["初领日期"] is None)
+        ):
+            from patches import apply_no_review_layout_patch
+            apply_no_review_layout_patch(text_blocks, fields)
+
         return fields
 
     # ------------------------------------------------------------------
@@ -331,7 +479,7 @@ class FieldExtractor:
     # ------------------------------------------------------------------
 
     def _find_label_tokens(self, text_blocks: List[TextBlock]) -> List[_LabelToken]:
-        """扫描所有文本块，识别纯标签或“标签+值”粘连块。"""
+        """扫描所有文本块，识别纯标签或"标签+值"粘连块。"""
         tokens: List[_LabelToken] = []
         for idx, block in enumerate(text_blocks):
             raw_text = block.text.strip()
@@ -367,7 +515,7 @@ class FieldExtractor:
         block: TextBlock,
         raw_text: str,
     ) -> Optional[_LabelToken]:
-        """尝试从“标签+分隔符/值”的粘连块中分离标签前缀与剩余值。"""
+        """尝试从"标签+分隔符/值"的粘连块中分离标签前缀与剩余值。"""
         stripped = raw_text.lstrip()
         for alias, field_key in self._alias_pairs:
             # 允许标签字符间夹带空格，后接可选冒号/空白
@@ -748,13 +896,14 @@ class FieldExtractor:
         bottom_top_y: Optional[float],
         fields: FieldDict,
     ) -> None:
-        """在已确认的人像右侧区域提取：姓名、作业类别、性别、操作项目。"""
+        """在已确认的人像右侧区域提取：证号、姓名、作业类别、性别、操作项目。"""
         ref_h = _ref_height(list(anchors.values()))
         left_col_x, right_col_x = self._resolve_column_bounds(anchors, ref_h)
 
         row1_anchors = [a for a in anchors.values() if a.row == 1 and not a.is_value_anchor]
         row2_anchors = [a for a in anchors.values() if a.row == 2 and not a.is_value_anchor]
 
+        row1_label_y = min(a.bbox.y for a in row1_anchors) if row1_anchors else None
         row2_label_y = min(a.bbox.y for a in row2_anchors) if row2_anchors else None
 
         # 计算各行向下的垂直边界
@@ -763,6 +912,16 @@ class FieldExtractor:
             row1_y_limit = bottom_top_y - 0.1 * ref_h
 
         row2_y_limit = bottom_top_y - 0.1 * ref_h if bottom_top_y is not None else None
+
+        # 0. 证号（通栏提取，分层校验）
+        fields["证号"] = self._extract_cert_no(
+            anchors=anchors,
+            row1_label_y=row1_label_y,
+            left_col_x=left_col_x,
+            ref_h=ref_h,
+            text_blocks=text_blocks,
+            label_block_indices=label_block_indices,
+        )
 
         # 1. 姓名（必须有本字段标签）
         name_anchor = anchors.get("姓名")
@@ -855,8 +1014,11 @@ class FieldExtractor:
         row2_label_y = min(a.bbox.y for a in row2_anchors) if row2_anchors else None
         row1_y_limit = row2_label_y - 0.1 * ref_h if row2_label_y is not None else None
 
-        # 1. 有效期截止日期（先解析，因为已确认的有效期区间值行可辅助初领日期标签漏检定位）
-        validity_anchor = anchors.get("有效期截止日期")
+        # 记录已确认归属有效期截止日期的文本块索引，避免误判为跨栏块
+        validity_block_indices: Set[int] = set()
+
+        # 1. 有效期双端点（先解析，因为已确认的有效期区间值行可辅助初领日期标签漏检定位）
+        validity_anchor = anchors.get(VALIDITY_SLOT_KEY)
         confirmed_range_bbox: Optional[TextBlock] = None
 
         if validity_anchor is not None:
@@ -872,23 +1034,52 @@ class FieldExtractor:
                     allow_multiline=False,
                     is_left_col=False,
                 )
+
+                # 若下方为空且标签为"有效期至"，受限检查同行紧邻右侧块
+                if raw_validity is None and validity_anchor.label_token.matched_alias in VALID_UNTIL_EXACT_LABELS:
+                    raw_validity = self._collect_inline_right_neighbor(
+                        token=validity_anchor.label_token,
+                        text_blocks=text_blocks,
+                        label_block_indices=label_block_indices,
+                        ref_h=ref_h,
+                    )
+                    if raw_validity is not None:
+                        # 构造伪 used_blocks 用于后续块索引记录
+                        for idx, b in enumerate(text_blocks):
+                            if b.text.strip() == raw_validity.strip() and _is_same_row(validity_anchor.label_token.block, b):
+                                used_blocks = [b]
+                                break
+
                 if raw_validity is not None:
-                    range_parsed = _parse_date_range(raw_validity)
-                    if range_parsed is not None:
-                        fields["有效期截止日期"] = range_parsed[1]
-                        if used_blocks:
+                    # 使用双端点独立解析
+                    start_date, end_date = _parse_validity_endpoints(
+                        raw_validity,
+                        validity_anchor.label_token.matched_alias,
+                    )
+
+                    # 只要任一端点非空，就填充对应字段并记录块索引
+                    if start_date is not None:
+                        fields["有效期开始日期"] = start_date
+                    if end_date is not None:
+                        fields["有效期截止日期"] = end_date
+
+                    # 只要解析出任一端点，就记录有效期块索引
+                    if (start_date is not None or end_date is not None) and used_blocks:
+                        # 若两端点均有效，记录完整区间框用于初领日期恢复
+                        if start_date is not None and end_date is not None:
                             confirmed_range_bbox = _union_bbox(used_blocks, raw_validity)
-                    elif validity_anchor.label_token.matched_alias in VALID_UNTIL_EXACT_LABELS:
-                        # 仅明确的“有效期至”标签可直接接受单个合法日期
-                        single_iso = _parse_single_date(raw_validity)
-                        if single_iso is not None:
-                            fields["有效期截止日期"] = single_iso
-                            if used_blocks:
-                                confirmed_range_bbox = _union_bbox(used_blocks, raw_validity)
+
+                        used_ids = {id(b) for b in used_blocks}
+                        for idx, b in enumerate(text_blocks):
+                            if id(b) in used_ids:
+                                validity_block_indices.add(idx)
+
             elif validity_anchor.range_evidence is not None:
                 # 标签漏检但完整有效期区间直接作为区域证据被确认
+                fields["有效期开始日期"] = validity_anchor.range_evidence.start_date
                 fields["有效期截止日期"] = validity_anchor.range_evidence.end_date
                 confirmed_range_bbox = validity_anchor.range_evidence.bbox
+                validity_block_indices.update(validity_anchor.range_evidence.block_indices)
         elif right_col_x is not None:
             # 有效期限标签漏检时，若右列起点已由签发机关确认，检查 Row1 右栏是否存在匹配的完整有效期区间
             matched_ev = self._find_range_in_row1_right(
@@ -899,11 +1090,14 @@ class FieldExtractor:
                 range_evidences=range_evidences,
             )
             if matched_ev is not None:
+                fields["有效期开始日期"] = matched_ev.start_date
                 fields["有效期截止日期"] = matched_ev.end_date
                 confirmed_range_bbox = matched_ev.bbox
+                validity_block_indices.update(matched_ev.block_indices)
 
-        # 2. 初领日期
+        # 2. 初领日期（排除已确认归属有效期截止日期的块索引）
         first_anchor = anchors.get("初领日期")
+        first_excluded_indices = label_block_indices | validity_block_indices
         if first_anchor is not None and first_anchor.label_token is not None:
             raw_first = self._collect_labeled_field_value(
                 token=first_anchor.label_token,
@@ -912,7 +1106,7 @@ class FieldExtractor:
                 y_bottom_limit=row1_y_limit,
                 ref_h=ref_h,
                 text_blocks=text_blocks,
-                label_block_indices=label_block_indices,
+                label_block_indices=first_excluded_indices,
                 allow_multiline=False,
                 is_left_col=True,
             )
@@ -924,7 +1118,7 @@ class FieldExtractor:
                 left_col_x=left_col_x,
                 ref_h=ref_h,
                 text_blocks=text_blocks,
-                label_block_indices=label_block_indices,
+                label_block_indices=first_excluded_indices,
             )
 
         # 3. 签发机关（有标签按栏取，允许换行；无标签时仅在右列起点已确认的底部第二行右栏取唯一可辨认机关名）
@@ -1263,7 +1457,7 @@ class FieldExtractor:
     ) -> Optional[str]:
         """
         性别标签漏检时的受限恢复：
-        仅在人像右侧区域第二行左栏取唯一的“男”或“女”。
+        仅在人像右侧区域第二行左栏取唯一的"男"或"女"。
         """
         # 必须能明确锁定第二行的垂直范围（由同行右标签操作项目给出，或由第一行标签向下推演）
         if row2_anchors:
@@ -1374,7 +1568,7 @@ class FieldExtractor:
     ) -> Optional[str]:
         """
         签发机关标签漏检时的受限恢复（文档 3.5.3）：
-        仅在底部第二行右栏取唯一、完整且可辨认的机关名称（如以“应急管理局”结尾）。
+        仅在底部第二行右栏取唯一、完整且可辨认的机关名称（如以"应急管理局"结尾）。
         """
         review_anchor = anchors.get("应复审日期")
         if review_anchor is not None:
@@ -1454,7 +1648,7 @@ class FieldExtractor:
 
     @staticmethod
     def _validate_gender(text: Optional[str]) -> Optional[str]:
-        """仅接受单个“男”或“女”。"""
+        """仅接受单个"男"或"女"。"""
         if not text:
             return None
         cleaned = re.sub(r"\s+", "", text)
@@ -1489,6 +1683,97 @@ class FieldExtractor:
             if not any(compact.endswith(suffix) for suffix in _ORG_SUFFIXES):
                 return None
         return compact
+
+    def _extract_cert_no(
+        self,
+        anchors: Dict[str, _RegionAnchor],
+        row1_label_y: Optional[float],
+        left_col_x: Optional[float],
+        ref_h: float,
+        text_blocks: List[TextBlock],
+        label_block_indices: Set[int],
+    ) -> Optional[str]:
+        """
+        提取证号字段（三条路径分层校验）。
+
+        路径 A/B（有"证号"标签）：通栏提取 + 宽松文本编号校验
+        路径 C（无标签但强特征值锚点）：直接保留严格 T + 18 位格式
+        """
+        cert_anchor = anchors.get("证号")
+        y_limit = row1_label_y - 0.1 * ref_h if row1_label_y is not None else None
+
+        # 路径 A/B：有"证号"标签锚点（含粘连）
+        if cert_anchor is not None and cert_anchor.label_token is not None:
+            token = cert_anchor.label_token
+            raw = None
+
+            # 路径 A：标签与值粘连（如 "证号：00123456" / "证号T44522..."）
+            if token.inline_value is not None:
+                raw = token.inline_value
+            else:
+                # 路径 B：常规上下排布或同行紧邻右侧
+                raw = self._collect_labeled_field_value(
+                    token=token,
+                    col_start_x=cert_anchor.bbox.x,
+                    col_right_limit=None,  # 关键：证号为顶部通栏，不按作业类别列截断
+                    y_bottom_limit=y_limit,
+                    ref_h=ref_h,
+                    text_blocks=text_blocks,
+                    label_block_indices=label_block_indices,
+                    allow_multiline=False,
+                    is_left_col=False,
+                )
+
+                # 若下方为空，受限检查同行紧邻右侧块
+                if raw is None:
+                    raw = self._collect_inline_right_neighbor(
+                        token=token,
+                        text_blocks=text_blocks,
+                        label_block_indices=label_block_indices,
+                        ref_h=ref_h,
+                    )
+
+            # 有标签时使用宽松文本编号校验
+            return _validate_cert_no_labeled(raw)
+
+        # 路径 C：无"证号"标签，但强特征证号值本身已作为锚点确认
+        if cert_anchor is not None and cert_anchor.is_value_anchor:
+            compact = re.sub(r"\s+", "", cert_anchor.bbox.text)
+            if _CERT_NO_RE.match(compact):
+                return compact
+
+        return None
+
+    def _collect_inline_right_neighbor(
+        self,
+        token: _LabelToken,
+        text_blocks: List[TextBlock],
+        label_block_indices: Set[int],
+        ref_h: float,
+    ) -> Optional[str]:
+        """
+        当标签正下方未取到值时，受限检查标签同行紧邻右侧块（gap <= 2.0 * ref_h）。
+        用于"有效期至"、"证号"等可能同行拆分的场景。
+        """
+        candidates: List[TextBlock] = []
+        for idx, block in enumerate(text_blocks):
+            if idx in label_block_indices or _is_noise_text(block.text):
+                continue
+            if not _is_same_row(token.block, block):
+                continue
+            gap = block.x - token.block.x_max
+            if gap < -0.3 * ref_h or gap > 2.0 * ref_h:
+                continue
+            if block.x <= token.block.x:
+                continue
+            candidates.append(block)
+
+        if not candidates:
+            return None
+
+        # 取最左侧的候选块
+        candidates.sort(key=lambda b: b.x)
+        return candidates[0].text.strip()
 
 
 # 供外部模块直接调用的函数入口（契合文档 3.5 节）

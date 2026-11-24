@@ -11,11 +11,14 @@ from typing import List, Optional
 
 from config import DEFAULT_DB_PATH, FIELD_KEYS
 from models import (
+    CertificateKey,
+    CertificateRecord,
     FieldDict,
     FileInfo,
     FileStatus,
     ProcessResult,
     count_non_empty_fields,
+    extract_certificate_key,
 )
 
 
@@ -52,7 +55,7 @@ class DataRepository:
         return conn
 
     def _init_database(self) -> None:
-        """初始化 files 表、extracted_fields 表及索引。"""
+        """初始化四表（files、extracted_fields、certificates、certificate_files）及索引。"""
         conn = self._get_connection()
         try:
             # 仅此建库连接需暂停外键，避免重建父表时级联删除历史字段。
@@ -81,6 +84,40 @@ class DataRepository:
                         FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE,
                         UNIQUE(file_id, field_key)
                     )
+                    """
+                )
+                # 新增：certificates 表（证件归并主表，联合主键）
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS certificates (
+                        cert_no TEXT NOT NULL,
+                        work_category TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (cert_no, work_category),
+                        CHECK (length(trim(cert_no)) > 0 AND length(trim(work_category)) > 0)
+                    )
+                    """
+                )
+                # 新增：certificate_files 表（证件与文件的多对多关联表）
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS certificate_files (
+                        file_id TEXT PRIMARY KEY,
+                        cert_no TEXT NOT NULL,
+                        work_category TEXT NOT NULL,
+                        linked_at TEXT NOT NULL,
+                        FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE,
+                        FOREIGN KEY (cert_no, work_category)
+                            REFERENCES certificates(cert_no, work_category) ON DELETE RESTRICT
+                    )
+                    """
+                )
+                # 为 certificate_files 建立联合主键查询索引
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_cert_files_cert_key
+                    ON certificate_files(cert_no, work_category)
                     """
                 )
         finally:
@@ -169,14 +206,15 @@ class DataRepository:
         fields: FieldDict,
     ) -> str:
         """
-        单事务保存成功文件记录、整页原文和固定七条字段。
+        单事务保存成功文件记录、整页原文和固定九条字段。
+        当证号与作业类别均非空时，同事务内原子 upsert certificates 并建立关联。
 
-        前提：必须已取得 file_hash，且 fields 包含固定七个键并至少有一个可信非空值。
+        前提：必须已取得 file_hash，且 fields 包含固定九个键并至少有一个可信非空值。
 
         Args:
             file_info: 文件信息
             raw_text: 整页 OCR 原文
-            fields: 固定七键字段字典
+            fields: 固定九键字段字典
 
         Returns:
             本次保存生成的 UUID4 file_id
@@ -184,12 +222,13 @@ class DataRepository:
         if not file_info.file_hash:
             raise ValueError("保存成功记录时 file_hash 不能为空")
         if set(fields.keys()) != set(FIELD_KEYS):
-            raise ValueError(f"字段集合必须严格等于固定七个键: {FIELD_KEYS}")
+            raise ValueError(f"字段集合必须严格等于固定九个键: {FIELD_KEYS}")
         if count_non_empty_fields(fields) < 1:
             raise ValueError("保存成功记录的前提是至少存在一个可信非空字段")
 
         file_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
+        cert_key = extract_certificate_key(fields)
 
         conn = self._get_connection()
         try:
@@ -218,6 +257,25 @@ class DataRepository:
                         VALUES (?, ?, ?)
                         """,
                         (file_id, key, fields[key]),
+                    )
+
+                # 若证号与作业类别均非空，建立证件归并与关联
+                if cert_key is not None:
+                    cert_no, work_category = cert_key
+                    conn.execute(
+                        """
+                        INSERT INTO certificates (cert_no, work_category, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(cert_no, work_category) DO UPDATE SET updated_at = excluded.updated_at
+                        """,
+                        (cert_no, work_category, created_at, created_at),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO certificate_files (file_id, cert_no, work_category, linked_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (file_id, cert_no, work_category, created_at),
                     )
             return file_id
         finally:
@@ -318,6 +376,20 @@ class DataRepository:
 
             fields: FieldDict = {key: value for key, value in field_rows}
 
+            # 查询证件关联（若存在）
+            cert_row = conn.execute(
+                """
+                SELECT cert_no, work_category
+                FROM certificate_files
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+
+            certificate_key: Optional[CertificateKey] = None
+            if cert_row is not None:
+                certificate_key = (cert_row[0], cert_row[1])
+
             return ProcessResult(
                 file_id=file_id,
                 file_info=file_info,
@@ -326,6 +398,7 @@ class DataRepository:
                 fields=fields,
                 error_message=error_message,
                 created_at=created_at,
+                certificate_key=certificate_key,
             )
         finally:
             conn.close()
@@ -343,6 +416,107 @@ class DataRepository:
         results: List[ProcessResult] = []
         for (fid,) in rows:
             record = self.query_by_file_id(fid)
+            if record is not None:
+                results.append(record)
+        return results
+
+    def query_by_certificate_key(
+        self,
+        cert_no: str,
+        work_category: str,
+    ) -> Optional[CertificateRecord]:
+        """
+        按联合主键查询证件归并记录。
+
+        Args:
+            cert_no: 证号
+            work_category: 作业类别
+
+        Returns:
+            CertificateRecord 对象；若不存在则返回 None
+        """
+        conn = self._get_connection()
+        try:
+            cert_row = conn.execute(
+                """
+                SELECT created_at, updated_at
+                FROM certificates
+                WHERE cert_no = ? AND work_category = ?
+                """,
+                (cert_no, work_category),
+            ).fetchone()
+
+            if cert_row is None:
+                return None
+
+            created_at, updated_at = cert_row
+
+            # 查询关联的所有文件 ID（按关联时间升序）
+            file_rows = conn.execute(
+                """
+                SELECT file_id
+                FROM certificate_files
+                WHERE cert_no = ? AND work_category = ?
+                ORDER BY linked_at ASC, rowid ASC
+                """,
+                (cert_no, work_category),
+            ).fetchall()
+
+            file_ids = [row[0] for row in file_rows]
+
+            return CertificateRecord(
+                cert_no=cert_no,
+                work_category=work_category,
+                file_ids=file_ids,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        finally:
+            conn.close()
+
+    def query_files_by_certificate_key(
+        self,
+        cert_no: str,
+        work_category: str,
+    ) -> List[ProcessResult]:
+        """
+        按联合主键查询该证件关联的所有文件记录。
+
+        Args:
+            cert_no: 证号
+            work_category: 作业类别
+
+        Returns:
+            ProcessResult 列表（按关联时间升序）
+        """
+        cert_record = self.query_by_certificate_key(cert_no, work_category)
+        if cert_record is None:
+            return []
+
+        results: List[ProcessResult] = []
+        for file_id in cert_record.file_ids:
+            record = self.query_by_file_id(file_id)
+            if record is not None:
+                results.append(record)
+        return results
+
+    def query_all_certificates(self) -> List[CertificateRecord]:
+        """按创建时间顺序查询库中所有证件归并记录。"""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT cert_no, work_category
+                FROM certificates
+                ORDER BY rowid ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        results: List[CertificateRecord] = []
+        for cert_no, work_category in rows:
+            record = self.query_by_certificate_key(cert_no, work_category)
             if record is not None:
                 results.append(record)
         return results

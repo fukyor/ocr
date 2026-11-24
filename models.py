@@ -5,22 +5,47 @@
 """
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from config import FIELD_KEYS
 
-# 固定七个字段的标准键值字典类型
+# 固定九个字段的标准键值字典类型
 FieldDict = Dict[str, Optional[str]]
+
+# 证件联合主键类型：(证号, 作业类别)
+CertificateKey = Tuple[str, str]
 
 
 def create_empty_fields() -> FieldDict:
-    """创建固定七个键、值全为 None 的标准字段字典。"""
+    """创建固定九个键、值全为 None 的标准字段字典。"""
     return {key: None for key in FIELD_KEYS}
 
 
 def count_non_empty_fields(fields: FieldDict) -> int:
-    """统计固定七个字段中非空值的数量。"""
+    """统计固定九个字段中非空值的数量。"""
     return sum(1 for key in FIELD_KEYS if fields.get(key) is not None)
+
+
+def extract_certificate_key(fields: FieldDict) -> Optional[CertificateKey]:
+    """
+    从字段字典中提取证件联合主键。
+
+    仅当"证号"与"作业类别"均非空且去空白后非空串时，返回 (证号, 作业类别) 元组。
+    否则返回 None（表示无法建立证件关联）。
+    """
+    cert_no = fields.get("证号")
+    work_category = fields.get("作业类别")
+
+    if cert_no is None or work_category is None:
+        return None
+
+    cert_no_clean = cert_no.strip()
+    work_category_clean = work_category.strip()
+
+    if not cert_no_clean or not work_category_clean:
+        return None
+
+    return (cert_no_clean, work_category_clean)
 
 
 class OCRStatus(str, Enum):
@@ -101,6 +126,18 @@ class ProcessResult:
     file_info: FileInfo  # 源文件信息
     status: FileStatus  # 处理状态
     raw_text: Optional[str] = None  # 整页 OCR 原文（若已取得）
-    fields: FieldDict = field(default_factory=dict)  # 成功时为七键字典，失败/不支持时为空字典
+    fields: FieldDict = field(default_factory=dict)  # 成功时为九键字典，失败/不支持时为空字典
     error_message: Optional[str] = None  # 失败或不支持原因
     created_at: Optional[str] = None  # ISO 8601 创建时间
+    certificate_key: Optional[CertificateKey] = None  # 证件联合主键（若已建立关联）
+
+
+@dataclass
+class CertificateRecord:
+    """按联合主键查询返回的证件归并记录。"""
+
+    cert_no: str  # 证号（联合主键第一部分）
+    work_category: str  # 作业类别（联合主键第二部分）
+    file_ids: List[str]  # 关联的全部源文件 file_id 列表（按关联时间升序）
+    created_at: str  # 首次建档时间（ISO 8601）
+    updated_at: str  # 最近关联更新时间（ISO 8601）

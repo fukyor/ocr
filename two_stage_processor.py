@@ -5,8 +5,9 @@
 """
 from typing import Dict, List, Optional, Set, Tuple
 
+from config import VALID_UNTIL_EXACT_LABELS
 from models import FieldDict, TextBlock, create_empty_fields
-from field_extractor import extract_fields
+from field_extractor import extract_fields, _is_noise_text
 
 
 class TwoStageProcessor:
@@ -86,11 +87,22 @@ class TwoStageProcessor:
         检查是否需要触发第二阶段。
 
         触发条件：
-        1. 存在缺失字段
+        1. 存在缺失字段（但排除"有效期至"单止日证件仅缺起日的合法情况）
         2. 操作项目缺"高"字（高处安装、维护、拆除作业）
         """
         # 检查缺失
         missing_fields = [k for k, v in fields.items() if v is None]
+
+        # 特殊情况：若仅缺失"有效期开始日期"且已确定"有效期截止日期"，检查是否为"有效期至"单止日证件
+        if missing_fields == ["有效期开始日期"] and fields.get("有效期截止日期") is not None:
+            # 检查文本块中是否存在"有效期至"标签
+            for block in text_blocks:
+                normalized = block.text.strip().replace("：", "").replace(":", "")
+                if any(normalized.startswith(label) for label in VALID_UNTIL_EXACT_LABELS):
+                    # 合法的单止日证件，免于无效复核
+                    missing_fields = []
+                    break
+
         if missing_fields:
             return True, f"缺失字段: {', '.join(missing_fields[:3])}"
 
@@ -120,6 +132,9 @@ class TwoStageProcessor:
         known_values = {v for v in fields.values() if v and len(v) >= 2}
 
         for block in text_blocks:
+            # 跳过卡外噪声块，避免备注等干扰 ROI 估算
+            if _is_noise_text(block.text):
+                continue
             for val in known_values:
                 if val in block.text or block.text in val:
                     field_blocks.append(block)
@@ -174,6 +189,8 @@ class TwoStageProcessor:
         1. 两次一致 → 保留
         2. 只有一次取得值且归属明确 → 保留该值
         3. 两次冲突 → 留空（需要额外佐证，当前简化为留空）
+
+        特殊校验：合并后若有效期起止日期均非空但逻辑倒置（start > end），双端置空
         """
         merged = create_empty_fields()
 
@@ -193,6 +210,15 @@ class TwoStageProcessor:
             else:
                 # 冲突 → 留空（简化策略）
                 merged[key] = None
+
+        # 跨阶段有效期起止日期一致性校验
+        start_date = merged.get("有效期开始日期")
+        end_date = merged.get("有效期截止日期")
+        if start_date is not None and end_date is not None:
+            if start_date > end_date:
+                # 逻辑倒置，双端置空
+                merged["有效期开始日期"] = None
+                merged["有效期截止日期"] = None
 
         return merged
 

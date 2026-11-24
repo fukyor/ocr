@@ -15,6 +15,7 @@ from typing import Callable, Dict, Optional, Tuple
 from config import (
     DEFAULT_DB_PATH,
     DEFAULT_FAST_DB_PATH,
+    FIELD_KEYS,
     OCR_FAST_CONFIG,
     OCR_PRODUCTION_CONFIG,
 )
@@ -260,7 +261,7 @@ class OCRProcessor:
             print(f"[失败: 零个可信字段 | file_id={file_id}]")
             return
 
-        # 5. 至少一个字段可信 -> 单事务保存成功记录、完整原文和七条字段
+        # 5. 至少一个字段可信 -> 单事务保存成功记录、完整原文和九条字段
         file_id = self.db.save_success(
             file_info=file_info,
             raw_text=ocr_result.raw_text or "",
@@ -271,7 +272,7 @@ class OCRProcessor:
         # 清理缓存
         self._file_content_cache.pop(norm_path, None)
 
-        print(f"[成功: {non_empty_count}/7 字段 | file_id={file_id}]")
+        print(f"[成功: {non_empty_count}/{len(FIELD_KEYS)} 字段 | file_id={file_id}]")
 
     @staticmethod
     def _read_file(file_path: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
