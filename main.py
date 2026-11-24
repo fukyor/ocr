@@ -4,13 +4,15 @@
 默认使用正式高精度 OCR 组合，也支持通过 --fast 切换为次高精度快速推理（仅写入独立测试库）。
 逐文件执行读取、哈希校验、幂等跳过、OCR 识别、字段提取与事务持久化。
 单文件读取/解码/识别/提取异常仅登记当前文件并继续；目录不可枚举或数据库读写失败属于批次故障，以非零状态退出。
+
+FR-06 新增：支持 -export 模式，只读导出数据库记录为 XLSX 表格，不加载 OCR 重型依赖。
 """
 import argparse
 import hashlib
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 from config import (
     DEFAULT_DB_PATH,
@@ -30,8 +32,11 @@ from models import (
     TextBlock,
     count_non_empty_fields,
 )
-from ocr_engine import OCREngine
 from two_stage_processor import process_with_two_stage_review
+
+# FR-06: 延迟导入 OCREngine（仅在识别模式按需加载，导出模式不加载）
+if TYPE_CHECKING:
+    from ocr_engine import OCREngine
 
 ExtractorFn = Callable[[list[TextBlock], int, int], FieldDict]
 
@@ -42,7 +47,7 @@ class OCRProcessor:
     def __init__(
         self,
         db_path: Optional[str] = None,
-        ocr_engine: Optional[OCREngine] = None,
+        ocr_engine: Optional["OCREngine"] = None,
         extractor: ExtractorFn = extract_fields,
         repository: Optional[DataRepository] = None,
         enable_two_stage: bool = True,
@@ -78,9 +83,15 @@ class OCRProcessor:
             "failed": 0,
         }
 
-    def _get_ocr_engine(self) -> OCREngine:
-        """批次内复用同一个 OCR 引擎实例，无候选文件时不额外加载模型。"""
+    def _get_ocr_engine(self) -> "OCREngine":
+        """
+        批次内复用同一个 OCR 引擎实例，无候选文件时不额外加载模型。
+
+        FR-06: 延迟导入 OCREngine，确保执行 -export 模式时不加载重型视觉依赖。
+        """
         if self._ocr_engine is None:
+            from ocr_engine import OCREngine  # 延迟导入
+
             ocr_config = OCR_FAST_CONFIG if self.fast_mode else OCR_PRODUCTION_CONFIG
             self._ocr_engine = OCREngine(ocr_config=ocr_config)
         return self._ocr_engine
@@ -303,21 +314,34 @@ class OCRProcessor:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """命令行入口函数。"""
+    """
+    命令行入口函数。
+
+    支持两种模式：
+    1. 识别模式（默认）：批量识别输入目录的证件文件并持久化到数据库
+    2. 导出模式（-export）：只读导出数据库记录为 XLSX 表格
+    """
     parser = argparse.ArgumentParser(
         description="中华人民共和国特种作业操作证 OCR 识别与结构化提取系统",
     )
     parser.add_argument(
+        "-export",
+        "--export",
+        dest="export",
+        action="store_true",
+        help="FR-06: 导出数据库记录为 XLSX 表格（只读模式，不识别新文件）",
+    )
+    parser.add_argument(
         "--input",
         type=str,
-        required=True,
-        help="输入目录路径（必填，仅扫描当前层）",
+        default=None,
+        help="输入目录路径（识别模式必填，仅扫描当前层）",
     )
     parser.add_argument(
         "--db",
         type=str,
         default=None,
-        help=f"SQLite 数据库路径（默认正式模式: {DEFAULT_DB_PATH}；--fast 模式: {DEFAULT_FAST_DB_PATH}）",
+        help=f"SQLite 数据库路径（识别模式默认：正式模式 {DEFAULT_DB_PATH}，--fast 模式 {DEFAULT_FAST_DB_PATH}；导出模式默认：{DEFAULT_DB_PATH}）",
     )
     parser.add_argument(
         "--fast",
@@ -326,6 +350,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    # 分支 1：FR-06 数据库表格导出模式（不建库、不校验 --input、不加载 OCR 引擎）
+    if args.export:
+        # 参数互斥守卫：导出模式不接受 --input 或 --fast
+        if args.fast or args.input is not None:
+            print(
+                "导出错误: -export 模式仅读取数据库，不接受 --input 或 --fast；\n"
+                "如需导出指定数据库（如快速测试库），请显式传入 --db 路径。",
+                file=sys.stderr,
+            )
+            return 1
+
+        # 确定只读库路径（默认读取正式库）
+        db_path = args.db if args.db is not None else DEFAULT_DB_PATH
+
+        # 延迟导入导出模块（避免模块顶层导入 openpyxl）
+        from excel_exporter import ExportError, export_database_to_xlsx
+
+        try:
+            summary = export_database_to_xlsx(db_path=db_path)
+        except (ExportError, sqlite3.Error, OSError) as exc:
+            print(f"导出失败: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"导出成功: {summary.output_path}（共 {summary.row_count} 条记录）")
+        return 0
+
+    # 分支 2：原有批量识别模式（与既有行为 100% 保持一致）
+    if args.input is None or args.input.strip() == "":
+        print(
+            "批次错误: 识别模式必须提供 --input 输入目录路径（如需导出已有数据库，请使用 -export）。",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.db is None:
         db_path = DEFAULT_FAST_DB_PATH if args.fast else DEFAULT_DB_PATH

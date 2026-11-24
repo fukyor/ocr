@@ -80,3 +80,23 @@ OCR_FAST_CONFIG: Dict[str, object] = {
     "rec_ocr_version": "PP-OCRv4",
     "rec_model_type": "mobile",
 }
+
+# FR-06 导出工作表配置（数据库记录导出为 XLSX 表格）
+EXPORT_SHEET_NAME: str = "识别结果"
+
+# FR-06 导出工作表 13 列中文表头（固定顺序）
+EXPORT_HEADERS: Tuple[str, ...] = (
+    "编号",
+    "姓名",
+    "性别",
+    "证号",
+    "作业类型",
+    "操作项目",
+    "初领日期",
+    "有效期开始日期",
+    "有效期截止日期",
+    "签发机关",
+    "文件路径",
+    "文件名",
+    "错误原因",
+)

@@ -13,6 +13,7 @@ from config import DEFAULT_DB_PATH, FIELD_KEYS
 from models import (
     CertificateKey,
     CertificateRecord,
+    ExportRow,
     FieldDict,
     FileInfo,
     FileStatus,
@@ -520,3 +521,135 @@ class DataRepository:
             if record is not None:
                 results.append(record)
         return results
+
+    @staticmethod
+    def query_export_rows_readonly(db_path: str) -> List[ExportRow]:
+        """
+        FR-06 纯只读导出查询入口（静态方法，不实例化 DataRepository）。
+
+        以 SQLite URI ?mode=ro + PRAGMA query_only = ON 打开连接，
+        在单读事务内校验表结构并按 files.rowid ASC 批量装配 ExportRow 列表。
+        旧库无 certificate_files 表时自动兼容降级，绝不报错。
+
+        前置校验：
+        - 路径存在且为常规文件（不存在/是目录 → 抛出 FileNotFoundError/IsADirectoryError，绝不新建空库）
+        - 数据库可读且包含 files 和 extracted_fields 表及必需列（损坏/缺表 → 抛出 sqlite3.DatabaseError）
+
+        Args:
+            db_path: 数据库文件路径
+
+        Returns:
+            ExportRow 列表（按入库顺序，可为空列表）
+
+        Raises:
+            FileNotFoundError: 数据库文件不存在
+            IsADirectoryError: 数据库路径是目录而非文件
+            sqlite3.Error: 数据库无法读取、损坏或表结构不完整
+            OSError: 其他文件系统错误
+        """
+        target = Path(db_path)
+
+        # 前置校验：路径存在且为常规文件
+        if not target.exists():
+            raise FileNotFoundError(f"数据库文件不存在: {target}")
+        if not target.is_file():
+            raise IsADirectoryError(f"数据库路径不是有效文件: {target}")
+
+        resolved = target.resolve()
+        uri = f"file:///{resolved.as_posix()}?mode=ro"
+
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")  # 保证多表查询位于同一只读快照中
+
+            # 1. 探测现有表集合并校验必需表
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            missing_tables = {"files", "extracted_fields"} - tables
+            if missing_tables:
+                raise sqlite3.DatabaseError(
+                    f"数据库表结构不完整，缺少必需表: {sorted(missing_tables)}"
+                )
+
+            # 2. 校验必需列存在（即使 0 条记录也能提前暴露异常表结构）
+            files_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info('files')")
+            }
+            required_files_columns = {"file_id", "file_name", "file_path", "error_message"}
+            missing_files_columns = required_files_columns - files_columns
+            if missing_files_columns:
+                raise sqlite3.DatabaseError(
+                    f"files 表缺少必需列: {sorted(missing_files_columns)}"
+                )
+
+            fields_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info('extracted_fields')")
+            }
+            required_fields_columns = {"file_id", "field_key", "field_value"}
+            missing_fields_columns = required_fields_columns - fields_columns
+            if missing_fields_columns:
+                raise sqlite3.DatabaseError(
+                    f"extracted_fields 表缺少必需列: {sorted(missing_fields_columns)}"
+                )
+
+            # 3. 按入库顺序读取全部 files 记录
+            file_rows = conn.execute(
+                """
+                SELECT file_id, file_name, file_path, error_message
+                FROM files
+                ORDER BY rowid ASC
+                """
+            ).fetchall()
+
+            # 4. 批量读取 extracted_fields 并按 file_id 分组（避免 N+1 查询）
+            fields_by_file: Dict[str, FieldDict] = {}
+            for fid, fkey, fval in conn.execute(
+                """
+                SELECT file_id, field_key, field_value
+                FROM extracted_fields
+                ORDER BY id ASC
+                """
+            ):
+                fields_by_file.setdefault(fid, {})[fkey] = fval
+
+            # 5. 若存在 certificate_files 表则批量读取证件关联（兼容早期 7 字段旧库）
+            cert_by_file: Dict[str, CertificateKey] = {}
+            if "certificate_files" in tables:
+                cert_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('certificate_files')")
+                }
+                required_cert_columns = {"file_id", "cert_no", "work_category"}
+                if required_cert_columns.issubset(cert_columns):
+                    for fid, cno, wcat in conn.execute(
+                        """
+                        SELECT file_id, cert_no, work_category
+                        FROM certificate_files
+                        """
+                    ):
+                        cert_by_file[fid] = (cno, wcat)
+
+            # 6. 逐条组装 ExportRow（每条 files 记录严格占一行）
+            result: List[ExportRow] = []
+            for fid, fname, fpath, err_msg in file_rows:
+                result.append(
+                    ExportRow(
+                        file_id=fid,
+                        file_name=fname,
+                        file_path=fpath,
+                        error_message=err_msg,
+                        fields=fields_by_file.get(fid, {}),
+                        certificate_key=cert_by_file.get(fid),
+                    )
+                )
+            return result
+        finally:
+            conn.close()
+

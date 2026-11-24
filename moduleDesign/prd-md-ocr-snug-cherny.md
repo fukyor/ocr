@@ -1,12 +1,12 @@
-# 特种作业操作证 OCR 系统 — 模块设计方案（V3.0）
+# 特种作业操作证 OCR 系统 — 模块设计方案（V3.2）
 
-**项目阶段**　增量架构设计（整合既有七字段实现、两阶段复核、2026 新版无复审补丁，以及 FR-04 / FR-05 增量需求）
+**项目阶段**　增量架构设计（一期识别复核 + FR-04/FR-05 联合主键与有效期双端点已实施验收；FR-06 数据库表格导出已实施验收）
 
-**文档状态**　架构审查修订稿（已对齐全部代码库现状与 `prd1.md` 增量需求，待按本文实施编码与验收）
+**文档状态**　最新架构定稿。一期及 FR-04/FR-05 已完成；FR-06 已完成开发与验收。
 
-**需求依据**　[需求分析说明书 V1.1](../prd/prd(已完成).md) · [证号、联合主键与有效期开始日期增量需求](../prd/prd1.md)
+**需求依据**　[需求分析说明书 V1.1](../prd/prd(已完成).md) · [证号、联合主键与有效期开始日期增量需求](../prd/prd1(已完成).md) · [数据库表格导出需求](../prd/prd2.md)
 
-**工程准则**　最小化设计、准确度优先（错填为零）、文件可追溯、单文件异常隔离；能原位微调且不影响既有稳定性的直接微调，可能影响既有稳定性的严格解耦为独立补丁。
+**工程准则**　最小化设计、准确度优先（错填为零）、文件可追溯、单文件异常隔离；能原位微调且不影响既有稳定性的直接微调，可能影响既有稳定性的严格解耦为独立补丁或独立模块。
 
 ---
 
@@ -14,7 +14,8 @@
 
 ### 1.1 任务边界
 
-处理指定文件夹当前层的 PNG、JPG/JPEG 和单页 PDF，目标证件为**中华人民共和国特种作业操作证**。每份文件保留在原位置，可按 `file_id` 查回源文件路径、处理状态、整页 OCR 原文和固定九个结构化字段；当“证号”与“作业类别”均确定时，按联合主键 `(证号, 作业类别)` 归并或建立唯一证件记录，并关联对应的源文件 `file_id`，支持同号异类独立建档与同号同类多文件追溯。失败或不支持记录不建立证件关联，失败记录保留已取得的原文。
+1. **批量识别与持久化（一期 + FR-04/FR-05）**：处理指定文件夹当前层的 PNG、JPG/JPEG 和单页 PDF，目标证件为**中华人民共和国特种作业操作证**。每份文件保留在原位置，可按 `file_id` 查回源文件路径、处理状态、整页 OCR 原文和固定九个结构化字段；当“证号”与“作业类别”均确定时，按联合主键 `(证号, 作业类别)` 归并或建立唯一证件记录，并关联对应的源文件 `file_id`，支持同号异类独立建档与同号同类多文件追溯。失败或不支持记录不建立证件关联，失败记录保留已取得的原文。
+2. **数据库记录导出为 XLSX 表格（FR-06 新增）**：支持在项目目录执行 `uv run main.py -export`（默认读取 `./data/ocr.db`，或显式通过 `--db` 指定数据库），**仅以只读方式**从已有 SQLite 数据库导出全部 `files` 处理记录为 13 列中文表头的 `.xlsx` 工作簿，默认输出到所选数据库同目录并沿用其主文件名（如 `data/ocr_fast.db` → `data/ocr_fast.xlsx`）。导出流程无需 `--input`、不重新识别源文件、不修改或新建数据库，严格保证证号文本原样不失真、三个日期按 `YYYY-MM-DD` 显示、空值与历史缺失字段留空，以及异常时给出具体原因并非零退出。
 
 ### 1.2 目标证件真实版面差异与共性
 
@@ -42,17 +43,20 @@
 
 ### 1.3 增量需求稳定性评估（微调 vs 解耦边界矩阵）
 
-严格遵循 `AGENTS.md` 准则，逐项评估 FR-04、FR-05 及关联改动对既有 7 字段基线（`set1` + `set2`）的稳定性影响：
+严格遵循 `AGENTS.md` 准则，逐项评估 FR-04、FR-05（已落地）与 FR-06（本次新增）对既有识别基线（`set1` + `set2` + `set3`）的稳定性影响：
 
-| 变更点 | 变更方式 | 对既有 7 字段识别稳定性的影响分析 | 决策 |
+| 变更点 | 变更方式 | 对既有识别稳定性的影响分析 | 决策 |
 |---|---|---|---|
-| **FR-04 证号提取** | 原位微调 `field_extractor.py` | 复用已有 `_UPPER_SLOTS["证号"]=(0,0)` 与 `_find_cert_no_anchors`；不改 `_confirm_region` 与 `_anchors_compatible`；无标签锚点维持严格 `^T\d{17}[\dXx]$`，仅在有“证号”标签时放宽文本编号校验（保留字母与前导零） | **安全原位微调** |
-| **FR-05 有效期双端点解析** | 保留 `_parse_date_range` 不变，新增 `_parse_validity_endpoints` | `_find_date_range_evidences`（区域锚点证据 & 初领日期无标签恢复基准框）继续使用严格完整区间校验，保证零错填稳定性不受半残缺区间影响；仅在已确认标签栏位内启用独立端点解析 | **逻辑隔离微调** |
-| **FR-05 有效期块排除集** | 微调 `_extract_bottom_region` | 有标签下只要解析出起日或止日任一端点，即将所采纳块并入 `validity_block_indices`，保障半残缺区间在新版微左偏版式下也不误杀 `初领日期` | **安全原位微调** |
-| **FR-05 同步至新版无复审补丁** | 更新 `patches/no_review_layout_patch.py` | 补丁与主提取器物理隔离，升级其有效期辅助提取同时补齐起/止两日，仍严守双重门控与只补空位（Fill-Missing-Only） | **解耦补丁同步** |
-| **FR-05 与两阶段复核协作** | 微调 `two_stage_processor.py` | 当仅缺失 `有效期开始日期` 且已由明确 `有效期至` 标签确定 `有效期截止日期` 时，免于无谓触发二阶段局部 OCR；两阶段合并后追加起止日期逻辑一致性校验（`start <= end`） | **安全原位微调** |
-| **FR-04 联合主键持久化** | 新增 `certificates` 与 `certificate_files` 两表 | **零侵入**存量 `files` 与 `extracted_fields` 表结构及旧库迁移逻辑，完全向后兼容历史 7 字段库，数据库层原生强制联合主键与外键约束 | **增量扩展表** |
-| **明确不动边界** | — | `file_scanner.py`、`ocr_engine.py` 核心推理与裁边缩放补边参数、`_UPPER_SLOTS`/`_BOTTOM_SLOTS` 相对网格坐标、`_confirm_region`、`_anchors_compatible`、跨栏阈值 `0.35 * label_h`、`expand_x / expand_y` 均不改动 | **冻结保护** |
+| **FR-04 证号提取（已落地）** | 原位微调 `field_extractor.py` | 复用已有 `_UPPER_SLOTS["证号"]=(0,0)` 与 `_find_cert_no_anchors`；不改 `_confirm_region` 与 `_anchors_compatible`；无标签锚点维持严格 `^T\d{17}[\dXx]$`，仅在有“证号”标签时放宽文本编号校验（保留字母与前导零） | **安全原位微调** |
+| **FR-05 有效期双端点解析（已落地）** | 保留 `_parse_date_range` 不变，新增 `_parse_validity_endpoints` | `_find_date_range_evidences` 继续使用严格完整区间校验，保证零错填稳定性不受半残缺区间影响；仅在已确认标签栏位内启用独立端点解析 | **逻辑隔离微调** |
+| **FR-05 有效期块排除集与补丁同步（已落地）** | 微调 `_extract_bottom_region` 与 `patches/no_review_layout_patch.py` | 有标签下只要解析出起日或止日任一端点即并入排除集；补丁与主提取器物理隔离，仍严守双重门控与只补空位 | **解耦补丁同步** |
+| **FR-05 与两阶段复核协作（已落地）** | 微调 `two_stage_processor.py` | 仅缺失 `有效期开始日期` 且明确为 `有效期至` 单止日标签时免触发二阶段复核；合并后追加 `start <= end` 校验 | **安全原位微调** |
+| **FR-04 联合主键持久化（已落地）** | 新增 `certificates` 与 `certificate_files` 两表 | 零侵入存量 `files` 与 `extracted_fields` 表结构及旧库迁移逻辑，完全向后兼容历史 7 字段库 | **增量扩展表** |
+| **FR-06 表格导出核心（本次新增）** | 新增独立模块 `excel_exporter.py` | 与 OCR 引擎、字段提取器、两阶段复核及版式补丁完全无依赖，物理隔离，零识别回归风险 | **完全解耦新增模块** |
+| **FR-06 数据库只读查询（本次新增）** | 在 `data_repository.py` 增量新增独立只读查询入口 | 使用 SQLite URI `?mode=ro` + `PRAGMA query_only = ON`，完全不触碰 `DataRepository.__init__` 的建库/迁移及所有既有写/读接口 | **零侵入只读扩展** |
+| **FR-06 配置与契约扩展（本次新增）** | 在 `config.py` 新增 13 列导出表头常量，在 `models.py` 新增 `ExportRow` / `ExportSummary` | 仅追加只读常量与数据结构，不修改现有 `FIELD_KEYS`、标签映射及 OCR 参数 | **安全增量常量** |
+| **FR-06 CLI 入口接入（本次新增）** | 微调 `main.py` 参数解析并在 `_get_ocr_engine` 内延迟导入 `OCREngine` | `-export` 在最前置分支直接分流至导出模块，避免加载重型 OCR 依赖；未指定 `-export` 时识别路径、`OCRProcessor` 接口及退出码语义 100% 不变 | **安全入口分支微调** |
+| **FR-06 实施期间明确冻结边界** | — | `file_scanner.py`、`ocr_engine.py`、`field_extractor.py`、`two_stage_processor.py`、`patches/no_review_layout_patch.py` 全量一字不动 | **冻结保护** |
 
 ---
 
@@ -62,7 +66,10 @@
 
 ```mermaid
 flowchart LR
-    Input["输入目录"] --> Scanner["file_scanner: 扫描当前层候选文件"]
+    CLI["CLI 入口 main.py"] --> Mode{"是否指定 -export ?"}
+
+    Mode -- "否(识别模式)" --> Input["输入目录(--input)"]
+    Input --> Scanner["file_scanner: 扫描当前层候选文件"]
     Scanner --> Main["main: 逐文件读取内容并计算 SHA-256"]
     Main -- "读取失败" --> NonSuccess["保存 failed 记录(空哈希,零字段,无证件关联)"]
     Main -- "取得哈希" --> Idem{"同路径同哈希已有 success 记录?"}
@@ -82,29 +89,41 @@ flowchart LR
     Unsupported --> DB
     SaveLinked --> DB
     SaveUnlinked --> DB
+
+    Mode -- "是(FR-06 导出模式)" --> ReadOnly["data_repository: 只读快照查询(URI mode=ro)"]
+    DB -. "只读读取(绝不建库/改库)" .-> ReadOnly
+    ReadOnly -- "不存在/不可读/缺表" --> ExportFail["打印具体错误至 stderr 并以退出码 1 结束"]
+    ReadOnly -- "ExportRow 列表(含 0 条)" --> Exporter["excel_exporter: 写 13 列工作簿 + 临时文件原子替换"]
+    Exporter -- "写入/替换失败" --> ExportFail
+    Exporter -- "成功" --> Sheet["目标 .xlsx 工作簿(同目录同名)"]
 ```
 
 ### 2.2 模块依赖关系（无环 DAG）
 
 ```mermaid
 flowchart TD
-    Main["main.py (CLI入口与批次编排)"]
+    Main["main.py (CLI入口、模式分发与批次编排)"]
+    Exporter["excel_exporter.py (FR-06 XLSX 表格导出)"]
     Scanner["file_scanner.py (目录扫描)"]
     OCR["ocr_engine.py (媒体解码与OCR推理)"]
     TwoStage["two_stage_processor.py (两阶段复核)"]
     Extractor["field_extractor.py (双区域9字段提取)"]
     Patch["patches/no_review_layout_patch.py (新版无复审解耦补丁)"]
-    Repo["data_repository.py (SQLite 四表事务仓储)"]
+    Repo["data_repository.py (SQLite 四表事务仓储 + 只读导出查询)"]
     Models["models.py (标准数据契约)"]
     Config["config.py (最小化常量配置)"]
 
+    Main --> Exporter
     Main --> Scanner
-    Main --> OCR
+    Main -. "识别模式按需延迟导入" .-> OCR
     Main --> TwoStage
     Main --> Extractor
     Main --> Repo
     Main --> Models
     Main --> Config
+    Exporter --> Repo
+    Exporter --> Models
+    Exporter --> Config
     Scanner --> Config
     OCR --> Models
     OCR --> Config
@@ -118,13 +137,15 @@ flowchart TD
     Repo --> Config
 ```
 
+> **导出路径零视觉依赖设计**：`excel_exporter.py` 仅依赖 `data_repository.py`（只读查询入口）、`models.py`、`config.py` 与 `openpyxl`，与 OCR/视觉链路零耦合；`main.py` 在 `OCRProcessor._get_ocr_engine()` 内延迟导入 `OCREngine`，确保执行 `uv run main.py -export` 时不加载 `rapidocr`/`onnxruntime`/`cv2`/`pymupdf`，实现毫秒级启动响应。
+
 ---
 
 ## 三、各模块详细设计（含流程图与伪代码）
 
 ### 3.1 最小化配置模块（`config.py`）
 
-集中保存扩展名白名单、PDF 渲染 DPI、正式/快速双档数据库路径与 OCR 参数、固定九个标准输出键及标签别名映射。几何匹配规则属于提取器内部算法，不进入配置。
+集中保存扩展名白名单、PDF 渲染 DPI、正式/快速双档数据库路径与 OCR 参数、固定九个标准输出键与标签别名映射，以及 FR-06 导出工作表的 13 列中文表头与工作表名称。几何匹配规则与单元格格式化逻辑属于各自模块内部算法，不进入配置，严守最小化配置原则。
 
 #### 核心字段与标签契约（9 字段）
 
@@ -136,20 +157,27 @@ flowchart TD
 | `作业类别` | `作业类别` `(1,1)` | `作业类别`、`作业类型` | 本栏完整作业类别名称（如 `电工作业`、`高处作业`）。 |
 | `操作项目` | `操作项目` `(2,1)` | `操作项目`、`操作类型` | 可接续同栏紧邻左对齐下一行，保留原有标点。 |
 | `初领日期` | `初领日期` `(1,0)` | `初领日期`、`初次领取日期`、`初领目期` | 底部第一行左栏单个合法日历日期，`YYYY-MM-DD`。 |
-| `有效期开始日期` | 共享 `有效期限` `(1,1)` | 见下方 `VALIDITY_LABEL_ALIASES` | 有效期限起日，`YYYY-MM-DD`，须独立确定，无法确定记为 `None`。 |
-| `有效期截止日期` | 共享 `有效期限` `(1,1)` | 见下方 `VALIDITY_LABEL_ALIASES` | 有效期限止日，`YYYY-MM-DD`，须独立确定，无法确定记为 `None`。 |
+| `有效期开始日期` | 共享 `有效期限` `(1,1)` | 见下方 `FIELD_LABEL_ALIASES` | 有效期限起日，`YYYY-MM-DD`，须独立确定，无法确定记为 `None`。 |
+| `有效期截止日期` | 共享 `有效期限` `(1,1)` | 见下方 `FIELD_LABEL_ALIASES` | 有效期限止日，`YYYY-MM-DD`，须独立确定，无法确定记为 `None`。 |
 | `签发机关` | `签发机关` `(2,1)` / 新版 `(2,0)` | `签发机关`、`发证机关` | 本栏完整机构名称，允许换行续接。 |
 
-- **有效期限槽位标签（防双键冲突）**：在 `config.py` 中用独立常量 `VALIDITY_SLOT_KEY = "有效期限"` 与 `SLOT_LABEL_ALIASES`（或保持 `FIELD_LABEL_ALIASES` 不重复绑定两键，将 `"有效期限" / "有效期" / "有效期至"` 统一映射到逻辑槽位 `"有效期限"`，由提取器同时填充 `有效期开始日期` 与 `有效期截止日期`）。
+- **有效期限槽位标签（防双键冲突）**：在 `config.py` 中用独立常量 `VALIDITY_SLOT_KEY = "有效期限"`，在 `FIELD_LABEL_ALIASES` 中将 `"有效期限" / "有效期" / "有效期至"` 统一映射到逻辑槽位 `"有效期限"`，由提取器同时填充 `有效期开始日期` 与 `有效期截止日期`。
 - **明确单止日标签**：`VALID_UNTIL_EXACT_LABELS = frozenset({"有效期至"})`。
 - **纯辅助定位标签**：`AUX_LABEL_ALIASES = {"应复审日期": ("应复审日期", "复审日期")}`（`证号` 已升格为正式输出字段，不再属于纯辅助键）。
-- **数据库路径隔离**：正式默认 `./data/ocr.db`，快速联调默认 `./data/ocr_fast.db`。
+- **数据库路径隔离**：识别正式模式默认 `./data/ocr.db`，识别快速联调模式默认 `./data/ocr_fast.db`；FR-06 导出模式（`-export`）始终默认读取 `./data/ocr.db`，如需导出其他数据库（含 `./data/ocr_fast.db`）须显式传入 `--db`。
+- **导出表头常量（FR-06 新增）**：`EXPORT_HEADERS` 固定定义 13 列中文表头顺序，`EXPORT_SHEET_NAME = "识别结果"`。
 
 #### 流程图
 
 ```mermaid
 flowchart TD
-    Start["加载 config.py 静态常量"] --> Mode{"命令行是否指定 --fast ?"}
+    Start["加载 config.py 静态常量"] --> ExportMode{"命令行是否指定 -export ?"}
+    ExportMode -- "是(FR-06 导出模式)" --> ExpDB{"用户显式指定了 --db ?"}
+    ExpDB -- "否" --> ExpDefaultDB["只读默认库 DEFAULT_DB_PATH(./data/ocr.db)"]
+    ExpDB -- "是" --> ExpCustomDB["只读指定数据库路径"]
+    ExpDefaultDB --> ExpHeaders["加载 EXPORT_HEADERS(13列) 与 EXPORT_SHEET_NAME"]
+    ExpCustomDB --> ExpHeaders
+    ExportMode -- "否(识别模式)" --> Mode{"命令行是否指定 --fast ?"}
     Mode -- "否(正式高精度)" --> ProdOCR["选用 OCR_PRODUCTION_CONFIG(v4 Det + v5 Server Rec)"]
     ProdOCR --> ProdDB["默认库路径 DEFAULT_DB_PATH(./data/ocr.db)"]
     Mode -- "是(开发快速联调)" --> FastOCR["选用 OCR_FAST_CONFIG(v4 Det + v4 Mobile Rec)"]
@@ -175,7 +203,7 @@ flowchart TD
 
 常量 VALIDITY_SLOT_KEY = "有效期限"
 
-常量 SLOT_LABEL_ALIASES = {
+常量 FIELD_LABEL_ALIASES = {
     "证号": ("证号",),
     "姓名": ("姓名",),
     "性别": ("性别",),
@@ -192,6 +220,14 @@ flowchart TD
 
 常量 VALID_UNTIL_EXACT_LABELS = {"有效期至"}
 
+# FR-06 导出工作表最小化核心常量
+常量 EXPORT_SHEET_NAME = "识别结果"
+常量 EXPORT_HEADERS = (
+    "编号", "姓名", "性别", "证号", "作业类型", "操作项目",
+    "初领日期", "有效期开始日期", "有效期截止日期", "签发机关",
+    "文件路径", "文件名", "错误原因"
+)
+
 常量 OCR_PRODUCTION_CONFIG = {
     engine_type="onnxruntime", det="ch_PP-OCRv4_mobile", rec="ch_PP-OCRv5_server",
     global_max_side_len=4600, det_limit_type="max", det_limit_side_len=3200
@@ -203,7 +239,7 @@ flowchart TD
 
 ### 3.2 数据契约模块（`models.py`）
 
-定义跨模块流转的标准 `dataclass` 与无第三方依赖的辅助函数，支撑九字段字典与证件归并视图。
+定义跨模块流转的标准 `dataclass` 与无第三方依赖的辅助函数，支撑九字段字典、证件归并视图以及 FR-06 只读导出行与导出结果摘要。
 
 #### 数据契约清单
 
@@ -214,8 +250,10 @@ flowchart TD
 | `FileInfo` | `file_name`、规范化绝对路径 `file_path`、小写 `file_ext`、可空 SHA-256 `file_hash`（仅读取失败时为 `None`）。 |
 | `TextBlock` | `text`、`confidence`、`x`、`y`、`width`、`height` 及衍生属性 `x_max`/`y_max`/`x_center`/`y_center`，坐标统一映射回纠偏后整页图像左上角原点。 |
 | `OCRResult` | `status`（`ok`/`unsupported`/`failed`）、`text_blocks`、`image_width`、`image_height`、`raw_text`、`error_message`。 |
-| `ProcessResult` | 按 `file_id` 查询返回：`file_id`、`file_info`、`status`、`raw_text`、`fields`、`error_message`、`created_at`、**新增 `certificate_key: Optional[CertificateKey] = None`**。 |
-| `CertificateRecord` | **新增**：按联合主键查询返回：`cert_no`、`work_category`、`file_ids: List[str]`、`created_at`、`updated_at`。 |
+| `ProcessResult` | 按 `file_id` 查询返回：`file_id`、`file_info`、`status`、`raw_text`、`fields`、`error_message`、`created_at`、`certificate_key: Optional[CertificateKey] = None`。 |
+| `CertificateRecord` | 按联合主键查询返回：`cert_no`、`work_category`、`file_ids: List[str]`、`created_at`、`updated_at`。 |
+| `ExportRow` | **FR-06 新增**：只读导出单行视图，包含 `file_id`、`file_name`、`file_path`、`error_message`、`fields: FieldDict`、`certificate_key: Optional[CertificateKey] = None`（严格限定为单份 `files` 记录及其本文件识别字段和可选证件关联）。 |
+| `ExportSummary` | **FR-06 新增**：导出完成后的结构化摘要，包含实际读取的 `db_path`、实际落盘的 `output_path` 和数据行数 `row_count`（不含表头，0 条时为 `0`）。 |
 
 #### 流程图（契约组装与校验流转）
 
@@ -229,6 +267,8 @@ flowchart LR
     CertKey --> ProcessResult["ProcessResult(含 file_id 与 certificate_key)"]
     NullKey --> ProcessResult
     CertKey --> CertRecord["CertificateRecord(联合主键 -> 多个 file_id)"]
+    DBRead["只读导出快照(files + extracted_fields + 可选 certificate_files)"] --> ExportRow["ExportRow(单文件导出行契约)"]
+    ExportRow --> ExportSummary["ExportSummary(db_path, output_path, row_count)"]
 ```
 
 #### 伪代码
@@ -270,6 +310,19 @@ flowchart LR
     file_ids: List[str]
     created_at: str
     updated_at: str
+
+数据类 ExportRow:
+    file_id: str
+    file_name: str
+    file_path: str
+    error_message: Optional[str] = None
+    fields: FieldDict = {}
+    certificate_key: Optional[CertificateKey] = None
+
+数据类 ExportSummary:
+    db_path: str
+    output_path: str
+    row_count: int
 ```
 
 ---
@@ -730,11 +783,14 @@ erDiagram
 | `save_success(file_info, raw_text, fields)` | 单事务校验 `file_hash` 非空、严格 9 键、至少 1 个非空值；依次写 `files`、9 行 `extracted_fields`；当 `extract_certificate_key(fields)` 非空时，在同一事务内原子 upsert `certificates` 并写入 `certificate_files`；缺任一主键字段时跳过后两步。任一步骤异常整笔回滚。 |
 | `save_non_success(file_info, status, error_message, raw_text=None)` | 单事务保存 `failed` 或 `unsupported`，零字段、不写证件及关联表。 |
 | `query_by_file_id(file_id)` | 查回 `files`、`extracted_fields` 及 `certificate_files`（填充 `certificate_key`）；失败/不支持记录也可查询，其 `fields={}`、`certificate_key=None`。 |
-| `query_by_certificate_key(cert_no, work_category)` | **新增**：按联合主键查回 `CertificateRecord`（含全部关联 `file_ids`），不存在返回 `None`。 |
-| `query_files_by_certificate_key(cert_no, work_category)` | **新增**：按联合主键查回该证件关联的全部 `ProcessResult` 列表，每份文件的独立识别结果完整可查。 |
+| `query_by_certificate_key(cert_no, work_category)` | 按联合主键查回 `CertificateRecord`（含全部关联 `file_ids`），不存在返回 `None`。 |
+| `query_files_by_certificate_key(cert_no, work_category)` | 按联合主键查回该证件关联的全部 `ProcessResult` 列表，每份文件的独立识别结果完整可查。 |
 | `query_all_files()` / `query_all_certificates()` | 按入库顺序枚举全部文件记录或全部证件归并记录。 |
+| `query_export_rows_readonly(db_path)` | **FR-06 新增静态只读入口**：**不实例化 `DataRepository`**（绝不建目录、绝不新建空库、绝不建表或迁移旧库）；前置校验路径存在且为常规文件，以 SQLite URI `?mode=ro` + `PRAGMA query_only = ON` 打开连接，在单读事务内校验 `files` / `extracted_fields` 表结构并按 `files.rowid ASC` 批量装配 `List[ExportRow]`；旧库无 `certificate_files` 表时自动兼容降级，绝不报错。 |
 
-#### 流程图（`save_success` 单事务原子写入流程）
+#### 流程图
+
+##### A. `save_success` 单事务原子写入流程
 
 ```mermaid
 flowchart TD
@@ -752,6 +808,27 @@ flowchart TD
     InsFields -- "任意 SQL 异常" --> Rollback
     UpsertCert -- "任意 SQL 异常" --> Rollback
     InsLink -- "任意 SQL 异常" --> Rollback
+```
+
+##### B. `query_export_rows_readonly` 只读快照导出查询流程（FR-06 新增）
+
+```mermaid
+flowchart TD
+    Entry["query_export_rows_readonly(db_path)"] --> Exists{"路径存在且为常规文件?"}
+    Exists -- "否" --> ErrPath["抛出 FileNotFoundError / IsADirectoryError(绝不建库)"]
+    Exists -- "是" --> OpenRO["以 URI file:///...?mode=ro 打开 + PRAGMA query_only = ON"]
+    OpenRO -- "无权限/损坏/非库文件" --> ErrSQL["上抛 sqlite3.Error / OSError"]
+    OpenRO -- "成功" --> BeginRead["开启只读快照事务 BEGIN"]
+    BeginRead --> CheckSchema{"files 与 extracted_fields 表及必需列均存在?"}
+    CheckSchema -- "否" --> ErrSchema["抛出 sqlite3.DatabaseError(数据库表结构不完整)"]
+    CheckSchema -- "是" --> QueryFiles["查询 files 表(ORDER BY rowid ASC)"]
+    QueryFiles --> QueryFields["批量查询 extracted_fields(ORDER BY id ASC)按 file_id 聚合"]
+    QueryFields --> HasCert{"certificate_files 表存在?"}
+    HasCert -- "是" --> QueryCert["批量查询 certificate_files 构建 file_id -> (cert_no, work_category)"]
+    HasCert -- "否(历史旧库兼容)" --> EmptyCert["证件关联映射置为空字典"]
+    QueryCert --> Assemble["逐条按 files 入库顺序装配 ExportRow 列表"]
+    EmptyCert --> Assemble
+    Assemble --> CloseConn["关闭只读连接并返回 List[ExportRow]"]
 ```
 
 #### 伪代码
@@ -820,21 +897,96 @@ flowchart TD
     record = query_by_certificate_key(cert_no, work_category)
     若 record 为 None: 返回 []
     返回 [query_by_file_id(fid) 对 fid 属于 record.file_ids 若结果非空]
+
+# FR-06 新增：纯只读导出查询入口（静态方法，绝不触发 DataRepository.__init__）
+静态方法 query_export_rows_readonly(db_path: str) -> List[ExportRow]:
+    target = Path(db_path)
+    若 target 不存在:
+        抛出 FileNotFoundError(f"数据库文件不存在: {target}")
+    若 target 不是常规文件:
+        抛出 IsADirectoryError(f"数据库路径不是有效文件: {target}")
+
+    resolved = target.resolve()
+    uri = f"{resolved.as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    尝试:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("BEGIN")   # 保证多表查询位于同一只读快照中
+
+        # 1. 探测现有表集合并校验必需表
+        tables = {row[0] 对 row 属于 conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        缺失必需表 = {"files", "extracted_fields"} - tables
+        若 缺失必需表 非空:
+            抛出 sqlite3.DatabaseError(f"数据库表结构不完整，缺少必需表: {sorted(缺失必需表)}")
+
+        # 2. 校验必需列存在（即使 0 条记录也能提前暴露异常表结构）
+        校验 pragma_table_info('files') 包含 {"file_id", "file_name", "file_path", "error_message"}
+        校验 pragma_table_info('extracted_fields') 包含 {"file_id", "field_key", "field_value"}
+
+        # 3. 按入库顺序读取全部 files 记录
+        file_rows = conn.execute(
+            "SELECT file_id, file_name, file_path, error_message FROM files ORDER BY rowid ASC"
+        ).fetchall()
+
+        # 4. 批量读取 extracted_fields 并按 file_id 分组（避免 N+1 查询与笛卡尔积）
+        fields_by_file = {}
+        遍历 (fid, fkey, fval) 属于 conn.execute(
+            "SELECT file_id, field_key, field_value FROM extracted_fields ORDER BY id ASC"
+        ):
+            fields_by_file.setdefault(fid, {})[fkey] = fval
+
+        # 5. 若存在 certificate_files 表则批量读取证件关联（兼容早期 7 字段旧库）
+        cert_by_file = {}
+        若 "certificate_files" 属于 tables:
+            校验 pragma_table_info('certificate_files') 包含 {"file_id", "cert_no", "work_category"}
+            遍历 (fid, cno, wcat) 属于 conn.execute(
+                "SELECT file_id, cert_no, work_category FROM certificate_files"
+            ):
+                cert_by_file[fid] = (cno, wcat)
+
+        # 6. 逐条组装 ExportRow（每条 files 记录严格占一行）
+        result = []
+        遍历 (fid, fname, fpath, err_msg) 属于 file_rows:
+            result.append(ExportRow(
+                file_id=fid,
+                file_name=fname,
+                file_path=fpath,
+                error_message=err_msg,
+                fields=fields_by_file.get(fid, {}),
+                certificate_key=cert_by_file.get(fid),
+            ))
+        返回 result
+    最后:
+        conn.close()
 ```
 
 ---
 
 ### 3.9 主流程编排模块（`main.py`）
 
-CLI 入口接收必填 `--input`、可选 `--db` 与可选 `--fast`。正式模式固定高精度模型与 `./data/ocr.db`，`--fast` 快速联调模式强制隔离至独立测试库（默认 `./data/ocr_fast.db`，拒绝写入正式默认库）。进度日志字段总数改用 `len(FIELD_KEYS)` 动态输出（不再硬编码 `/7`）。
+统一承接**批量识别模式**与 **FR-06 导出模式（`-export`）**两个命令行入口：
+- **导出模式（`-export` / `--export`）**：无需 `--input`，默认读取 `DEFAULT_DB_PATH`（`./data/ocr.db`）；如需导出其他数据库（如 `./data/ocr_fast.db`），须显式传入 `--db`。为避免用户误以为 `-export --fast` 会自动导出快速测试库而导出错库，导出模式下若同时传入 `--fast` 或 `--input`，立即提示参数冲突并以非零退出码结束。导出模式不实例化 `OCRProcessor`，直接转交第 3.10 节的 `excel_exporter.export_database_to_xlsx`；
+- **识别模式（未指定 `-export`）**：要求必须提供 `--input`，接受可选的 `--db` 与 `--fast`，行为与既有逻辑 100% 保持一致。正式模式固定高精度模型与 `./data/ocr.db`，快速联调模式写入独立测试库（默认 `./data/ocr_fast.db`，禁止写入正式默认库）；
+- **延迟导入优化**：`OCRProcessor._get_ocr_engine()` 内部按需导入 `OCREngine`（模块顶层仅保留 `TYPE_CHECKING` 类型引用与 `OCRProcessor` 类导出），既保证既有测试 `from main import OCRProcessor` 零破坏，又确保执行 `uv run main.py -export` 时不加载重型 OCR/PDF/图像视觉库。
 
 #### 流程图
 
 ```mermaid
 flowchart TD
-    CLI["CLI 解析 --input / --db / --fast"] --> FastGuard{"--fast 且 --db 指向正式默认库?"}
+    CLI["解析命令行参数: -export / --input / --db / --fast"] --> Mode{"是否指定 -export ?"}
+
+    Mode -- "是(FR-06 导出模式)" --> ExpConflict{"是否误传 --fast 或 --input ?"}
+    ExpConflict -- "是" --> ExpArgErr["输出参数互斥提示至 stderr 并返回 1"]
+    ExpConflict -- "否" --> ExpDB["确定只读库路径: args.db 若非空 否则 DEFAULT_DB_PATH"]
+    ExpDB --> RunExport["调用 excel_exporter.export_database_to_xlsx(db_path)"]
+    RunExport -- "成功(ExportSummary)" --> PrintExpOk["打印实际输出路径与导出数据行数，返回 0"]
+    RunExport -- "ExportError / OSError / sqlite3.Error" --> PrintExpErr["输出具体失败原因至 stderr，返回 1"]
+
+    Mode -- "否(识别模式)" --> Input{"已提供 --input ?"}
+    Input -- "否" --> ArgErr["提示需要 --input 目录并以非零状态退出"]
+    Input -- "是" --> FastGuard{"--fast 且 --db 指向正式默认库?"}
     FastGuard -- "是" --> ExitErr["输出错误并返回退出码 1"]
-    FastGuard -- "否" --> InitDB["初始化 DataRepository(四表建库)"]
+    FastGuard -- "否" --> InitDB["初始化 OCRProcessor / DataRepository(四表建库)"]
     InitDB -- "sqlite3 / OS 异常" --> ExitErr
     InitDB -- "成功" --> Scan["scan_folder(input_dir)"]
     Scan -- "目录异常" --> ExitErr
@@ -843,7 +995,7 @@ flowchart TD
     Read -- "OSError" --> SaveReadFail["save_non_success(failed, 空哈希)"]
     Read -- "成功" --> Idem{"find_existing_success_id 命中?"}
     Idem -- "是" --> StatSkip["skipped += 1，继续下一文件"]
-    Idem -- "否" --> RunOCR["OCREngine.recognize"]
+    Idem -- "否" --> RunOCR["延迟加载并调用 OCREngine.recognize"]
     RunOCR -- "unsupported" --> SaveUnsup["save_non_success(unsupported)"]
     RunOCR -- "failed/异常" --> SaveOCRFail["save_non_success(failed)"]
     RunOCR -- "ok" --> RunExt["两阶段复核提取 9 字段(或单阶段提取)"]
@@ -857,44 +1009,294 @@ flowchart TD
 
 ```text
 函数 main(argv) -> int:
-    解析参数 --input, --db, --fast
-    若 fast 且 显式 --db 解析后等于 DEFAULT_DB_PATH:
-        打印错误至 stderr 并返回 1
-    初始化 processor = OCRProcessor(db_path, fast_mode=fast)
-    ok = processor.process_folder(input_dir)
-    返回 0 若 ok 否则 1
+    配置 argparse:
+        "-export", "--export", dest="export", action="store_true"  # 导出数据库记录为 XLSX
+        "--input", type=str, required=False, default=None          # 识别模式必填
+        "--db", type=str, default=None                             # 数据库路径
+        "--fast", action="store_true"                              # 识别快速档
 
-函数 _process_single_file(file_path):
-    (content, file_hash, err) = _read_file(norm_path)
-    若 content 为 None:
-        db.save_non_success(file_info(hash=None), "failed", err, raw_text=None)
-        stats["failed"] += 1; 返回
+    args = parser.parse_args(argv)
 
-    若 db.find_existing_success_id(norm_path, file_hash) 非空:
-        stats["skipped"] += 1; 返回
+    # 分支 1：FR-06 数据库表格导出模式（不建库、不校验 --input、不加载 OCR 引擎）
+    若 args.export 为 True:
+        若 args.fast 为 True 或 args.input 非空:
+            打印 "导出错误: -export 模式仅读取数据库，不接受 --input 或 --fast；"
+                 "如需导出指定数据库（如快速测试库），请显式传入 --db 路径。" 至 stderr
+            返回 1
+        db_path = args.db 若 args.db 非空 否则 DEFAULT_DB_PATH
+        尝试:
+            summary = export_database_to_xlsx(db_path=db_path)
+        捕获 (ExportError, sqlite3.Error, OSError) as exc:
+            打印 f"导出失败: {exc}" 至 stderr
+            返回 1
+        打印 f"导出成功: {summary.output_path}（共 {summary.row_count} 条记录）"
+        返回 0
 
-    ocr_res = _get_ocr_engine().recognize(file_ext, content)  # 捕获非数据库异常并登记 failed
-    若 ocr_res.status 属于 (UNSUPPORTED, FAILED):
-        db.save_non_success(file_info, ocr_res.status, ocr_res.error_message, raw_text=None)
-        累加对应统计并返回
+    # 分支 2：原有批量识别模式（与既有行为 100% 保持一致）
+    若 args.input 为 None 或 args.input.strip() == "":
+        打印 "批次错误: 识别模式必须提供 --input 输入目录路径（如需导出已有数据库，请使用 -export）。" 至 stderr
+        返回 2
+
+    若 args.db 为 None:
+        db_path = DEFAULT_FAST_DB_PATH 若 args.fast 否则 DEFAULT_DB_PATH
+    否则:
+        db_path = args.db
+        若 args.fast 且 Path(db_path).resolve() == Path(DEFAULT_DB_PATH).resolve():
+            打印快速模式禁止写入正式库错误至 stderr
+            返回 1
 
     尝试:
-        若 enable_two_stage:
-            (fields, _, _) = process_with_two_stage_review(ocr_res.text_blocks, ocr_res.image_width, ocr_res.image_height, ocr_engine, file_ext, content)
-        否则:
-            fields = extractor(ocr_res.text_blocks, ocr_res.image_width, ocr_res.image_height)
-    捕获 异常 exc:
-        db.save_non_success(file_info, "failed", f"字段提取异常: {exc}", raw_text=ocr_res.raw_text)
-        stats["failed"] += 1; 返回
+        processor = OCRProcessor(db_path=db_path, fast_mode=args.fast)
+    捕获 (sqlite3.Error, OSError) as exc:
+        打印初始化失败至 stderr
+        返回 1
 
-    non_empty = count_non_empty_fields(fields)
-    若 non_empty == 0:
-        db.save_non_success(file_info, "failed", "未能从正面证件区域提取出有效字段", raw_text=ocr_res.raw_text)
-        stats["failed"] += 1; 返回
+    ok = processor.process_folder(args.input)
+    返回 0 若 ok 否则 1
 
-    file_id = db.save_success(file_info, ocr_res.raw_text, fields)   # sqlite3.Error 向上传播中止批次
-    stats["success"] += 1
-    打印 f"[成功: {non_empty}/{len(FIELD_KEYS)} 字段 | file_id={file_id}]"
+类 OCRProcessor:
+    方法 _get_ocr_engine(self):
+        若 self._ocr_engine 为 None:
+            from ocr_engine import OCREngine   # 延迟导入，避免 -export 模式加载重型视觉依赖
+            ocr_config = OCR_FAST_CONFIG 若 self.fast_mode 否则 OCR_PRODUCTION_CONFIG
+            self._ocr_engine = OCREngine(ocr_config=ocr_config)
+        返回 self._ocr_engine
+
+    方法 _process_single_file(self, file_path):
+        (content, file_hash, err) = _read_file(norm_path)
+        若 content 为 None:
+            db.save_non_success(file_info(hash=None), "failed", err, raw_text=None)
+            stats["failed"] += 1; 返回
+
+        若 db.find_existing_success_id(norm_path, file_hash) 非空:
+            stats["skipped"] += 1; 返回
+
+        ocr_res = _get_ocr_engine().recognize(file_ext, content)
+        若 ocr_res.status 属于 (UNSUPPORTED, FAILED):
+            db.save_non_success(file_info, ocr_res.status, ocr_res.error_message, raw_text=None)
+            累加对应统计并返回
+
+        尝试:
+            若 enable_two_stage:
+                (fields, _, _) = process_with_two_stage_review(ocr_res.text_blocks, ocr_res.image_width, ocr_res.image_height, ocr_engine, file_ext, content)
+            否则:
+                fields = extractor(ocr_res.text_blocks, ocr_res.image_width, ocr_res.image_height)
+        捕获 异常 exc:
+            db.save_non_success(file_info, "failed", f"字段提取异常: {exc}", raw_text=ocr_res.raw_text)
+            stats["failed"] += 1; 返回
+
+        non_empty = count_non_empty_fields(fields)
+        若 non_empty == 0:
+            db.save_non_success(file_info, "failed", "未能从正面证件区域提取出有效字段", raw_text=ocr_res.raw_text)
+            stats["failed"] += 1; 返回
+
+        file_id = db.save_success(file_info, ocr_res.raw_text, fields)
+        stats["success"] += 1
+        打印 f"[成功: {non_empty}/{len(FIELD_KEYS)} 字段 | file_id={file_id}]"
+```
+
+---
+
+### 3.10 数据库表格导出模块（`excel_exporter.py`）（FR-06，本次新增）
+
+负责将只读查询得到的全部文件处理记录（`List[ExportRow]`）按 FR-06 规范写入标准 `.xlsx` 工作簿。模块与 OCR 识别、字段提取、两阶段复核、版式补丁完全物理隔离，仅依赖 `openpyxl`、Python 标准库、`config.py`、`models.py` 和 `data_repository.DataRepository.query_export_rows_readonly`。
+
+#### 3.10.1 输出路径推导规则
+
+默认输出到所选数据库所在同一目录，沿用数据库主文件名并将扩展名设为 `.xlsx`（如 `data/ocr.db` → `data/ocr.xlsx`、`data/ocr_fast.db` → `data/ocr_fast.xlsx`）：
+- **常规带后缀库文件**：`Path(db_path).resolve().with_suffix(".xlsx")`；
+- **无后缀库文件（如 `data/ocr`）**：同样得到 `data/ocr.xlsx`；
+- **防覆盖源库守卫**：若源数据库文件本身后缀意外已为 `.xlsx`，则追加 `.xlsx` 生成 `<db_name>.xlsx`（或显式指定不冲突的 `output_path`），绝不覆盖源数据库文件本身；
+- Python API 层 `export_database_to_xlsx(db_path, output_path=None)` 保留可选 `output_path` 参数方便单测和二次集成，CLI 层默认传 `None` 使用自动推导路径。
+
+#### 3.10.2 13 列中文表头、取值优先级与单元格格式契约
+
+第一行从左到右严格写入 `config.EXPORT_HEADERS` 定义的 13 个中文表头，表头下方按 `files.rowid ASC` 入库顺序每条记录占一行（包括 `success`、`failed`、`unsupported` 全部记录；同一证件关联多份文件时各占一行，各取本文件识别值与来源路径）：
+
+| 列序 | 中文表头 | 取值优先级与来源 | 单元格类型与格式策略 | 空值/缺失处理 |
+|---|---|---|---|---|
+| 1 | `编号` | 本次导出行序号（首条为 `1`，逐行 `+1`） | 整数（`int`），数字格式 `"0"` | 必有值 |
+| 2 | `姓名` | `row.fields.get("姓名")` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 3 | `性别` | `row.fields.get("性别")` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 4 | `证号` | 优先 `row.certificate_key[0]`（若已建立关联且非空）；无关联时回退 `row.fields.get("证号")` | **强制文本原样写入（`data_type="s"` + `number_format="@"`）**，逐字符保留前导零、字母与超过 15 位的全部纯数字 | `None` / 空串留空 |
+| 5 | `作业类型` | 优先 `row.certificate_key[1]`（若已建立关联且非空）；无关联时回退 `row.fields.get("作业类别")` | 纯文本（`data_type="s"`）；注意表头为“作业类型”，回退读取字段键“作业类别” | `None` / 空串留空 |
+| 6 | `操作项目` | `row.fields.get("操作项目")` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 7 | `初领日期` | `row.fields.get("初领日期")` | 标准化为 `YYYY-MM-DD` 纯文本（`data_type="s"` + `number_format="@"`） | `None` / 空串留空 |
+| 8 | `有效期开始日期` | `row.fields.get("有效期开始日期")` | 标准化为 `YYYY-MM-DD` 纯文本（`data_type="s"` + `number_format="@"`） | `None` / 空串留空 |
+| 9 | `有效期截止日期` | `row.fields.get("有效期截止日期")` | 标准化为 `YYYY-MM-DD` 纯文本（`data_type="s"` + `number_format="@"`） | `None` / 空串留空 |
+| 10 | `签发机关` | `row.fields.get("签发机关")` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 11 | `文件路径` | `row.file_path` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 12 | `文件名` | `row.file_name` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+| 13 | `错误原因` | `row.error_message` | 纯文本（`data_type="s"`） | `None` / 空串留空 |
+
+#### 3.10.3 核心健壮性与安全写入设计
+
+1. **证号高精度文本保真与防 Excel 公式注入**：
+   - `openpyxl` 直接赋值字符串时，若内容以 `=` 开头会被自动标记为公式（`data_type="f"`）；若写入数字或未声明文本格式，Excel 在编辑或导入时容易吃掉前导零或将超过 15 位的纯数字转为科学计数法（如 `4.41322E+17`）。
+   - 因此所有文本列统一经 `_write_text_cell(ws, row_idx, col_idx, text, force_text_format=...)` 写入：先剔除 XML 1.0 非法控制字符（`\x00-\x08`, `\x0b`, `\x0c`, `\x0e-\x1f`，防止 `openpyxl.utils.exceptions.IllegalCharacterError` 导致导出崩溃），再以显式字符串类型写入（`cell.value = clean_text; cell.data_type = "s"`），并对**证号与三个日期列**显式设置 `cell.number_format = "@"`。
+2. **三个日期列的 `YYYY-MM-DD` 一致性策略**：
+   - 系统识别入库的合法日期本身已为 `YYYY-MM-DD` 文本。采用 `YYYY-MM-DD` 纯文本（`data_type="s"`, `number_format="@"`）而非区域敏感日期序列号写出，具有三重优势：① 在任意操作系统与 Excel/WPS 语言区域下均严格显示为 `YYYY-MM-DD`，不会变形为 `2025/5/13` 或 `5/13/2025`；② ISO 8601 字符串字典序天然等价于日期时间序，可直接排序筛选，且不会因列宽较窄显示 `########`；③ 若历史库中存在 `YYYY/M/D`、`YYYY.M.D` 等可解析变体，`_format_export_date` 将其规范为 `YYYY-MM-DD`；若存在不可解析的脏值则保留原样文本不崩溃，空值留空。
+3. **空表（0 条记录）正确性**：
+   - 当数据库表结构完整但 `files` 为 0 行时，循环 0 次，仍正常写入第 1 行 13 列中文表头并保存工作簿，返回 `ExportSummary(db_path=..., output_path=..., row_count=0)`。
+4. **临时文件 + 原子替换落盘（防 Windows 占用破坏旧文件与半截脏文件）**：
+   - 先在同一输出目录创建临时 `.xlsx` 文件（如 `tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.stem}_", suffix=".tmp.xlsx", delete=False)`），完整调用 `wb.save(tmp_path)` 落盘后再通过 `os.replace(tmp_path, target_path)` 原子替换目标文件；
+   - 若因目标文件正被 Excel/WPS 打开占用（Windows `PermissionError`）、目标路径为目录、无写入权限或磁盘空间不足发生异常：在异常捕获块中静默清理残留临时文件，向调用方抛出包含**具体目标路径与原因**的 `ExportError`，确保绝不留下损坏的半截 `.xlsx` 文件，也不破坏原有已存在的工作簿。
+5. **基础可读性排版（最小化原则）**：
+   - 冻结首行（`ws.freeze_panes = "A2"`）、表头行字体加粗；按列语义预设基础列宽并随内容长度适度自适应（带合理上限，如路径/错误列上限 60 字符），避免证号与日期默认被截断。
+
+#### 流程图
+
+```mermaid
+flowchart TD
+    In["export_database_to_xlsx(db_path, output_path=None)"] --> ReadDB["DataRepository.query_export_rows_readonly(db_path)"]
+    ReadDB -- "不存在/不可读/缺表" --> RaiseRead["包装为 ExportError(含具体原因) 向上抛出"]
+    ReadDB -- "返回 List[ExportRow](可为 0 条)" --> ResolveOut["推导或校验目标 .xlsx 路径(同目录同名,防覆写源库)"]
+    ResolveOut -- "目标路径为目录或父目录不可写" --> RaiseWrite["包装为 ExportError(含具体路径与原因) 向上抛出"]
+    ResolveOut -- "有效路径" --> CreateWB["新建 openpyxl.Workbook，命名工作表为 '识别结果'"]
+    CreateWB --> WriteHeader["第 1 行写入 13 列中文表头(加粗 + 冻结首行 A2)"]
+    WriteHeader --> Loop{"还有待写入的 ExportRow ?"}
+    Loop -- "是" --> ResolveRow["编号 +1；优先取 certificate_key 的证号/作业类型，无关联回退 fields"]
+    ResolveRow --> WriteCells["写 13 列：编号写整数；证号强文本 @；三日期 YYYY-MM-DD 文本 @；其余文本清洗控制符；空值留空"]
+    WriteCells --> Loop
+    Loop -- "否" --> AutoWidth["设置合理列宽(带上限保护)"]
+    AutoWidth --> SaveTmp["在目标同目录写入临时 .tmp.xlsx 文件"]
+    SaveTmp -- "保存异常" --> CleanTmp["删除残留临时文件并抛出 ExportError"]
+    SaveTmp -- "保存成功" --> AtomicReplace["os.replace(tmp_path, output_path) 原子替换"]
+    AtomicReplace -- "PermissionError(文件被占用) / OSError" --> CleanTmp
+    AtomicReplace -- "成功" --> RetSummary["返回 ExportSummary(db_path, output_path, row_count)"]
+```
+
+#### 伪代码
+
+```text
+异常类 ExportError(Exception):
+    """FR-06 导出失败统一异常，承载明确中文原因与路径上下文。"""
+
+常量 _ILLEGAL_XML_RE = 正则匹配 [\x00-\x08\x0b\x0c\x0e-\x1f]
+常量 _ISO_DATE_RE = 正则匹配 ^(\d{4})-(\d{2})-(\d{2})$
+常量 _FLEX_DATE_RE = 正则匹配 ^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?$
+
+函数 derive_export_output_path(db_path: Path) -> Path:
+    resolved = db_path.resolve()
+    若 resolved.suffix.lower() == ".xlsx":
+        返回 resolved.with_name(f"{resolved.name}.xlsx")   # 防覆盖源数据库文件
+    返回 resolved.with_suffix(".xlsx")
+
+函数 _sanitize_xml_text(text: str) -> str:
+    返回 _ILLEGAL_XML_RE.sub("", text)
+
+函数 _format_export_date(raw_value: Optional[str]) -> Optional[str]:
+    若 raw_value 为 None:
+        返回 None
+    cleaned = raw_value.strip()
+    若 cleaned == "":
+        返回 None
+    若 _ISO_DATE_RE.match(cleaned) 且为合法公历日期:
+        返回 cleaned
+    match = _FLEX_DATE_RE.match(cleaned)
+    若 match 非空 且 (年, 月, 日) 构成合法公历日期:
+        返回 f"{year:04d}-{month:02d}-{day:02d}"
+    返回 cleaned   # 兜底原样文本保留，不丢历史数据
+
+函数 _write_text_cell(ws, row_idx: int, col_idx: int, value: Optional[str], force_text_format: bool = False) -> None:
+    若 value 为 None 或 value == "":
+        返回   # 空值与历史缺失字段在单元格中留空
+    clean = _sanitize_xml_text(str(value))
+    若 clean == "":
+        返回
+    cell = ws.cell(row=row_idx, column=col_idx)
+    cell.value = clean
+    cell.data_type = "s"            # 显式强制纯文本（防 15 位以上数字失真、防前导零丢失、防 = 公式注入）
+    若 force_text_format:
+        cell.number_format = "@"
+
+函数 _extract_row_columns(index: int, row: ExportRow) -> Tuple[int, Optional[str], ...]:
+    # 证号与作业类型：优先取 certificate_files 关联值，无关联时分别回退至本文件识别字段
+    cert_no = None
+    work_type = None
+    若 row.certificate_key 非空:
+        (linked_cert_no, linked_work_cat) = row.certificate_key
+        cert_no = linked_cert_no 若 (linked_cert_no 非空 且 linked_cert_no.strip() != "") 否则 None
+        work_type = linked_work_cat 若 (linked_work_cat 非空 且 linked_work_cat.strip() != "") 否则 None
+    若 cert_no 为 None:
+        cert_no = row.fields.get("证号")
+    若 work_type 为 None:
+        work_type = row.fields.get("作业类别")
+
+    返回 (
+        index,                                               # 1. 编号
+        row.fields.get("姓名"),                              # 2. 姓名
+        row.fields.get("性别"),                              # 3. 性别
+        cert_no,                                             # 4. 证号
+        work_type,                                           # 5. 作业类型
+        row.fields.get("操作项目"),                          # 6. 操作项目
+        _format_export_date(row.fields.get("初领日期")),      # 7. 初领日期
+        _format_export_date(row.fields.get("有效期开始日期")), # 8. 有效期开始日期
+        _format_export_date(row.fields.get("有效期截止日期")), # 9. 有效期截止日期
+        row.fields.get("签发机关"),                          # 10. 签发机关
+        row.file_path,                                       # 11. 文件路径
+        row.file_name,                                       # 12. 文件名
+        row.error_message,                                   # 13. 错误原因
+    )
+
+函数 export_database_to_xlsx(db_path: str = DEFAULT_DB_PATH, output_path: Optional[str] = None) -> ExportSummary:
+    # 1. 只读查询数据库（不存在/无权限/损坏/缺表立即抛出具体原因）
+    尝试:
+        rows = DataRepository.query_export_rows_readonly(db_path)
+    捕获 (FileNotFoundError, IsADirectoryError, PermissionError, OSError, sqlite3.Error) as exc:
+        抛出 ExportError(f"无法读取数据库 {db_path}: {exc}")
+
+    # 2. 确定目标工作簿路径并校验非目录
+    resolved_db = Path(db_path).resolve()
+    target_path = Path(output_path).resolve() 若 output_path 非空 否则 derive_export_output_path(resolved_db)
+    若 target_path.exists() 且 target_path.is_dir():
+        抛出 ExportError(f"无法写入工作簿，目标路径是目录: {target_path}")
+
+    # 3. 构建 13 列标准工作簿
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = EXPORT_SHEET_NAME
+    ws.freeze_panes = "A2"
+
+    # 写入第 1 行中文表头（严格 13 列）
+    遍历 col_idx, title 属于 enumerate(EXPORT_HEADERS, start=1):
+        _write_text_cell(ws, 1, col_idx, title)
+        ws.cell(row=1, column=col_idx).font = Font(bold=True)
+
+    # 写入数据行（0 条时循环不执行，仅保留表头）
+    遍历 idx, row 属于 enumerate(rows, start=1):
+        excel_row = idx + 1
+        values = _extract_row_columns(idx, row)
+        # 第 1 列：编号（整数）
+        num_cell = ws.cell(row=excel_row, column=1, value=values[0])
+        num_cell.number_format = "0"
+        # 第 2~13 列：文本安全写入；证号(4)与三日期(7,8,9)强制文本格式 "@"
+        遍历 col_idx 属于 range(2, 14):
+            _write_text_cell(
+                ws, excel_row, col_idx, values[col_idx - 1],
+                force_text_format=(col_idx 属于 {4, 7, 8, 9})
+            )
+
+    按列预设并微调列宽（含最大宽度上限）
+
+    # 4. 临时文件 + 原子替换写入目标工作簿
+    tmp_path = None
+    尝试:
+        在 target_path.parent 创建临时文件 tmp_path（后缀 .tmp.xlsx，立即可写后关闭句柄）
+        wb.save(tmp_path)
+        os.replace(tmp_path, target_path)
+    捕获 PermissionError as exc:
+        清理 tmp_path（若存在）
+        抛出 ExportError(f"无法写入工作簿 {target_path}（文件可能正被其他程序占用或无写入权限）: {exc}")
+    捕获 OSError as exc:
+        清理 tmp_path（若存在）
+        抛出 ExportError(f"写入工作簿失败 {target_path}: {exc}")
+
+    返回 ExportSummary(
+        db_path=str(resolved_db),
+        output_path=str(target_path),
+        row_count=len(rows),
+    )
 ```
 
 ---
@@ -930,10 +1332,11 @@ flowchart TD
 | 组件 | 技术选型 | 说明 |
 |---|---|---|
 | 语言与包管理 | Python 3.12 / `uv`（`pyproject.toml`） | 统一使用 `uv run` 执行 |
-| OCR 引擎与图像处理 | `rapidocr` + `onnxruntime` + `opencv-python` + `numpy` + `Pillow` | 本地离线 CPU 推理与图像预处理 |
-| PDF 校验与渲染 | `PyMuPDF` (`pymupdf`) | 内存页数校验、加密校验及单页/ROI 渲染 |
-| 数据存储 | 标准库 `sqlite3` | 单文件事务、联合主键与外键原生支持 |
-| 日期与正则解析 | 标准库 `re` + `datetime` | 严格日历校验与区间端点分离 |
+| OCR 引擎与图像处理 | `rapidocr` + `onnxruntime` + `opencv-python` + `numpy` + `Pillow` | 本地离线 CPU 推理与图像预处理（导出模式不加载） |
+| PDF 校验与渲染 | `PyMuPDF` (`pymupdf`) | 内存页数校验、加密校验及单页/ROI 渲染（导出模式不加载） |
+| 数据存储 | 标准库 `sqlite3` | 单文件事务、联合主键与外键原生支持；导出采用 URI `?mode=ro` 纯只读连接 |
+| 表格导出（FR-06 新增） | `openpyxl`（`>=3.1.0`） | 生成标准 OOXML `.xlsx` 工作簿，原生支持纯文本类型（`data_type="s"`）、`@` 文本格式及单测回读验证 |
+| 日期与正则解析 | 标准库 `re` + `datetime` | 严格日历校验、区间端点分离与导出日期 `YYYY-MM-DD` 规范化 |
 
 ---
 
@@ -941,33 +1344,37 @@ flowchart TD
 
 ```text
 E:/D/zuoyewenjian/MyProject/ocr/
-├── pyproject.toml                       # uv 项目配置与最小核心依赖
-├── main.py                              # CLI 入口（含 --fast）、逐文件读取与哈希、状态编排
-├── config.py                            # 9 字段常量、有效期限逻辑槽位与双档 OCR 配置
-├── models.py                            # 标准数据契约（含 CertificateRecord 与主键辅助函数）
-├── file_scanner.py                      # 枚举当前层候选路径、过滤扩展名并排序
-├── ocr_engine.py                        # 媒体校验、裁边缩放补边、整页与 ROI 识别
-├── field_extractor.py                   # 双区域 9 字段提取、证号通栏取值、有效期双端点独立解析
-├── two_stage_processor.py               # 两阶段局部放大复核、噪声过滤与保守合并
-├── data_repository.py                   # SQLite 四表事务持久化、旧库迁移与双维查询
-├── patches/                             # 与主逻辑解耦的版式补丁目录
+├── pyproject.toml                       # uv 项目配置与最小核心依赖（FR-06 增补 openpyxl）
+├── main.py                              # CLI 入口（识别 --input/--fast 与导出 -export）、延迟加载 OCR 与编排
+├── config.py                            # 9 字段常量、有效期限逻辑槽位、双档 OCR 配置与 13 列导出表头
+├── models.py                            # 标准数据契约（含 CertificateRecord、ExportRow 与 ExportSummary）
+├── file_scanner.py                      # 枚举当前层候选路径、过滤扩展名并排序（FR-06 冻结不动）
+├── ocr_engine.py                        # 媒体校验、裁边缩放补边、整页与 ROI 识别（FR-06 冻结不动）
+├── field_extractor.py                   # 双区域 9 字段提取、证号通栏取值、有效期双端点解析（FR-06 冻结不动）
+├── two_stage_processor.py               # 两阶段局部放大复核、噪声过滤与保守合并（FR-06 冻结不动）
+├── data_repository.py                   # SQLite 四表事务持久化、旧库迁移、双维查询与只读导出查询
+├── excel_exporter.py                    # FR-06 新增：数据库记录 13 列 XLSX 表格导出与原子写盘
+├── patches/                             # 与主逻辑解耦的版式补丁目录（FR-06 冻结不动）
 │   ├── __init__.py
-│   └── no_review_layout_patch.py        # 2026 新版“无复审”底栏解耦补丁（同步支持有效期双端点）
+│   └── no_review_layout_patch.py        # 2026 新版“无复审”底栏解耦补丁
 ├── prd/                                 # 需求分析文档目录
-│   ├── prd(已完成).md                   # 一期需求说明书 V1.1
-│   └── prd1.md                          # FR-04 / FR-05 增量需求文档
+│   ├── prd(已完成).md                   # 一期需求说明书 V1.1（已完成）
+│   ├── prd1(已完成).md                  # FR-04 / FR-05 增量需求文档（已完成）
+│   └── prd2.md                          # FR-06 数据库表格导出需求（待开发、待验收）
 ├── moduleDesign/                        # 唯一模块设计文档目录
-│   └── prd-md-ocr-snug-cherny.md        # 本架构设计文档（V3.0）
+│   └── prd-md-ocr-snug-cherny.md        # 本架构设计文档（V3.2）
 ├── fix/                                 # 缺陷专项方案与实施记录
 ├── debug/                               # 调试与核验脚本目录
-├── tests/                               # 自动化单元测试与集成测试
-├── 证件模板/                            # 样本数据集（set1 / set2）
-└── data/                                # 运行时数据库目录（ocr.db / ocr_fast.db）
+├── tests/                               # 自动化单元测试与集成测试（FR-06 新增 test_excel_exporter.py）
+├── 证件模板/                            # 样本数据集（set1 / set2 / set3）
+└── data/                                # 运行时数据库与导出产物目录（ocr.db/ocr.xlsx、ocr_fast.db/ocr_fast.xlsx）
 ```
 
 ---
 
 ## 六、异常处理与容错矩阵
+
+### 6.1 识别入库模式异常矩阵
 
 | 场景 | 文件状态 | 内容哈希 | 整页原文 | 字段行 | 证件关联（`certificates` / `certificate_files`） | 后续处理 |
 |---|---|---|---|---|---|---|
@@ -981,11 +1388,25 @@ E:/D/zuoyewenjian/MyProject/ocr/
 | 补丁内部异常 | 静默回退 | 已取得 | 保存 | 保留主提取器结果 | 按主提取器结果判定 | 不中断单文件处理 |
 | 数据库不可用或写四表任一步骤失败 | 批次故障 | — | — | 整笔回滚 | 整笔回滚（无半截证件/关联） | 报告错误并非零退出 |
 
+### 6.2 FR-06 数据库表格导出模式异常与边界容错矩阵
+
+| 场景 | 检测位置 | 数据库副作用 | 输出文件副作用 | 用户提示与进程退出码 |
+|---|---|---|---|---|
+| 所选数据库文件不存在或路径为目录 | `query_export_rows_readonly` 前置校验 | 零副作用（绝不新建空库或目录） | 不生成工作簿 | `stderr` 输出具体路径与不存在/非文件原因，退出码 `1` |
+| 数据库无读权限、文件损坏或非 SQLite 文件 | `sqlite3.connect(?mode=ro)` / 表探查 | 零副作用 | 不生成工作簿 | `stderr` 输出具体数据库读取错误原因，退出码 `1` |
+| 数据库缺少 `files` 或 `extracted_fields` 表/核心列 | `query_export_rows_readonly` 结构校验 | 零副作用 | 不生成工作簿 | `stderr` 输出缺失的表或列名称，退出码 `1` |
+| 历史 7 字段库缺少 `certificate_files` 表或缺失 `证号`/`有效期开始日期` 字段 | `query_export_rows_readonly` + `excel_exporter` | 零副作用（不迁移旧库） | 正常生成工作簿，缺失项留空，作业类别正确落“作业类型”列 | `stdout` 显示实际输出路径与数据行数，退出码 `0` |
+| 表结构完整但 `files` 记录为 0 条 | `excel_exporter` | 零副作用 | 生成仅含 13 列中文表头的 `.xlsx` | `stdout` 显示实际输出路径并提示导出 `0` 条，退出码 `0` |
+| 证号含前导零或超 15 位纯数字 | `_write_text_cell` | 零副作用 | 以 `data_type="s"` + `number_format="@"` 逐字符原样写入 | 正常完成，退出码 `0` |
+| 文本含非法 XML 1.0 控制字符或以 `=` 开头 | `_sanitize_xml_text` + `_write_text_cell` | 零副作用 | 剔除非法控制字符并强制纯文本写入（不触发 Excel 公式解析） | 正常完成，退出码 `0` |
+| `-export` 同时传入 `--fast` 或 `--input` | `main.py` 参数守卫 | 零副作用 | 不生成工作簿 | `stderr` 提示参数互斥并引导使用 `--db` 指定数据库，退出码 `1` |
+| 目标工作簿被 Excel/WPS 占用（`PermissionError`）、目标为目录、无写权限或磁盘写满 | `excel_exporter` 落盘与 `os.replace` | 零副作用 | 清理残留 `.tmp.xlsx`，保留原有旧工作簿不被破坏，不留半截损坏文件 | `stderr` 输出具体写入路径及占用/权限原因，退出码 `1` |
+
 ---
 
 ## 七、验证与验收方案
 
-### 7.1 模块级单元测试矩阵（含 FR-04 / FR-05 全边界）
+### 7.1 模块级单元测试矩阵（含 FR-04 / FR-05 / FR-06 全边界）
 
 | 验证模块 | 关键用例与断言要点 |
 |---|---|
@@ -993,12 +1414,15 @@ E:/D/zuoyewenjian/MyProject/ocr/
 | **FR-05 有效期双端点** | 1. 完整区间 `2022-08-29至2028-08-28`（含单块、同行三拆块及斜杠/点/中文日期格式）：起日=`2022-08-29`，止日=`2028-08-28`，`初领日期` 保持 `2019-03-06`。<br>2. 明确“有效期至”标签 + `2028-08-28`（含上下排布、同行粘连、同行两块）：止日=`2028-08-28`，起日=`None`。<br>3. 仅能辨认左端：`2022-08-29 至` / `["2022-08-29", "至"]` / `2022-08-29至2031-55-12` → 起日=`2022-08-29`，止日=`None`。<br>4. 仅能辨认右端：`至 2028-08-28` / `2022-99-29至2028-08-28` → 起日=`None`，止日=`2028-08-28`。<br>5. 普通“有效期限”下仅有单个无分隔符日期 `2028-08-28` → 起止双空 `(None, None)`。<br>6. 起止倒置 `2028-08-28至2022-08-29` 或跨栏三日期粘连 `2026-09-20 2026-09-20至2032-09-19` → 起止双空且不破坏 `初领日期` 跨栏防线。 |
 | **新版补丁与两阶段协作** | 1. 谢鹏飞新版无复审实测文本块达到 `9/9`；模拟新版初领日期标签漏检时，补丁能同步补齐有效期起止日与初领日期；半残缺有效期在新版左偏 `0.71h` 场景下不误杀 `初领日期`。<br>2. “有效期至 2028-08-28”单止日证件在 8/9 其余全齐时，`_check_needs_review` 返回 `False`（免于无效二阶段复核）。<br>3. 两阶段合并结果若出现跨阶段 `start > end`，自动双端置 `None`。 |
 | **FR-04 联合主键持久化** | 1. **同号异类**：两份文件证号相同，作业类别分别为 `电工作业` 和 `高处作业` → `certificates` 存 2 条独立记录，`certificate_files` 各自关联对应 `file_id`。<br>2. **同号同类**：两份文件证号和作业类别均相同（不同路径或不同内容哈希）→ `certificates` 仅 1 条记录，`query_files_by_certificate_key` 查回 2 条独立 `ProcessResult`，且各自按 `file_id` 可查回独立原文与 9 条字段。<br>3. **主键缺项**：`证号` 为 `None` 或 `作业类别` 为 `None`（或空串）→ 保存 `files` 与 9 条字段，缺失字段为 `NULL`，`certificates` 与 `certificate_files` 均为 0 行，`ProcessResult.certificate_key` 为 `None`。<br>4. **历史 7 字段库兼容与事务回滚**：升级打开旧 7 字段库后，旧成功记录仍可按原 `file_id` 查回；模拟写 `certificate_files` 中途失败时，`files`、`extracted_fields`、`certificates` 一并回滚；删除单份 `files` 记录时仅级联删该 `file_id` 的关联行，不影响同证件另一源文件。 |
+| **FR-06 数据库表格导出（新增 `tests/test_excel_exporter.py`）** | 1. **混合状态与列序验收**：按序写入 1 条 `success`、1 条 `failed`、1 条 `unsupported` 记录后导出，回读验证第 1 行 13 列中文表头逐列完全一致；表头下恰 3 行，编号依次为 `1`、`2`、`3`；后两行保留各自文件路径、文件名、错误原因且第 2~10 列为 `None`。<br>2. **同证件多文件独立成行**：两份文件关联同一 `(cert_no, work_category)` 且各自字段值/来源路径有差异 → 导出为 2 行，各自准确展示本文件的 `extracted_fields`、文件路径与文件名，不串行不合并。<br>3. **缺项与历史 7 字段库兼容**：构造无 `certificate_files` 表的旧库或无证件关联记录（仅识别到 `作业类别`，缺少 `证号` 与 `有效期开始日期`）→ 作业类别准确落在第 5 列“作业类型”，缺失项留空，且导出前后原数据库文件字节/mtime 零变更。<br>4. **证号高精度文本保真**：测试前导零证号（如 `00441300123456`）、18 位纯数字证号（如 `441322199507034550`，超 15 位 IEEE-754 精度上限）、字母数字混合证号（如 `T445221199507034550` / `44162319930920031X`）→ 回读校验 `isinstance(cell.value, str)`、`cell.data_type == "s"`、`cell.number_format == "@"` 且与库值逐字符一致。<br>5. **三日期显示格式**：校验 `初领日期`、`有效期开始日期`、`有效期截止日期` 分别取各自已保存值并按 `YYYY-MM-DD` 文本写入（`number_format == "@"`），空值留空。<br>6. **0 条记录空库**：表结构完整但 0 条 `files` 记录 → 正常生成仅含 13 列中文表头的工作簿（`ws.max_row == 1`），CLI 打印输出路径并提示导出 `0` 条，退出码 `0`。<br>7. **防公式与非法字符**：错误原因/文件名含 `=SUM(A1:A2)` 或 `\x00` 控制字符 → 安全导出不抛异常且 `cell.data_type == "s"`。<br>8. **CLI 路径规则与失败非零退出**：验证 `main(["-export"])` 默认读 `DEFAULT_DB_PATH` 输出同目录同名 `.xlsx`；`main(["-export", "--db", ".../ocr_fast.db"])` 输出 `.../ocr_fast.xlsx`；数据库不存在（验证未创建新文件）、损坏/缺表、目标 `.xlsx` 写入失败（模拟 `PermissionError` 验证旧文件无损且无 `.tmp.xlsx` 残留）、`-export` 混传 `--fast`/`--input` → 均向 `stderr` 打印具体原因并返回非零退出码。 |
 
-### 7.2 端到端验收基准（9 字段 18/18 与真实样本集）
+### 7.2 端到端验收基准（9 字段 18/18、真实样本集与 FR-06 导出实测）
 
-自动化单测命令：`uv run --with pytest pytest -v`
-快速联调命令（遵循 `AGENTS.md` 测试规范）：`uv run main.py --input "./证件模板/set1" --fast`
-正式高精度验收命令：`uv run main.py --input "./证件模板/set1" --db "./data/ocr.db"`
+- 自动化单测命令：`uv run --with pytest pytest -v`
+- 快速联调识别命令（遵循 `AGENTS.md` 测试规范，测试前先删除 `data/` 下旧测试库）：`uv run main.py --input "./证件模板/set1" --fast`
+- 正式高精度识别命令：`uv run main.py --input "./证件模板/set1" --db "./data/ocr.db"`
+- FR-06 导出默认正式库命令：`uv run main.py -export`（读取 `./data/ocr.db`，生成 `./data/ocr.xlsx`，打印输出路径和数据行数）
+- FR-06 导出指定快速库命令：`uv run main.py -export --db "./data/ocr_fast.db"`（读取 `./data/ocr_fast.db`，生成 `./data/ocr_fast.xlsx`，打印输出路径和数据行数）
 
 #### 两张清晰原图逐字段验收基准（18/18 准确、零错填）
 
@@ -1014,19 +1438,24 @@ E:/D/zuoyewenjian/MyProject/ocr/
 | `有效期截止日期` | `2031-05-12` | `2028-08-28` |
 | `签发机关` | `惠州市应急管理局` | `东莞市应急管理局` |
 
-#### 真实样本集专项业务验收
+#### 真实样本集与导出专项业务验收
 
-| 真实样本 | 对应增量需求场景 | 预期结果 |
+| 验收场景 / 真实样本 | 对应需求场景 | 预期结果 |
 |---|---|---|
 | `set1/A44130044321008304苏志冲登高证.pdf` 与 `set1/A44530244322008484-苏志冲-电工证_01.jpg` | FR-04 同号异类 + FR-05 起日与初领不同 | 证号均为 `T441322198509044035`，在 `certificates` 保存 `("T441322198509044035", "高处作业")` 与 `("T441322198509044035", "电工作业")` 两条独立证件记录；登高证 `初领日期=2018-08-08`、`有效期开始日期=2021-10-18`、`有效期截止日期=2027-10-17`。 |
 | `set1/黄伟平.jpg`（低清截图） | FR-04 主键缺项不关联 | 提取出 `证号=T441322199210014012`（及既有可信字段），因 `作业类别=None` 不建立 `certificates` 与 `certificate_files` 关联，保留 `file_id` 追溯且零错填。 |
 | `set2/A44130032326012072谢鹏飞登高证.pdf` | 2026 新版无复审 + 9 字段全量 | 达到 `9/9`（`证号=T320481200105290034`、`初领日期=2026-09-20`、`有效期开始日期=2026-09-20`、`有效期截止日期=2032-09-19`、`签发机关=惠州市应急管理局`），其余 9 份 `set2` 样本全部 `9/9` 零回归。 |
+| 对快速测试库执行 `uv run main.py -export --db "./data/ocr_fast.db"` | FR-06 端到端表格导出 | 生成 `./data/ocr_fast.xlsx`，终端输出实际路径和精确行数；Excel/WPS 打开核对 13 列中文表头、行序、证号完整文本（含纯数字/前导零/字母）、三日期 `YYYY-MM-DD`、文件路径/文件名及失败记录错误原因全部一致；随后再核对源库未被修改。 |
 
 ---
 
-## 八、后续实施顺序（编码阶段指引）
+## 八、后续实施顺序（FR-06 编码阶段指引）
 
-1. **配置与数据契约升级（`config.py`、`models.py`）**：将 `FIELD_KEYS` 扩展为 9 键，理顺 `VALIDITY_SLOT_KEY` 逻辑槽位，新增 `CertificateRecord` 与 `extract_certificate_key`。
-2. **四表持久化与双维查询（`data_repository.py`）**：新增 `certificates` 与 `certificate_files` 表结构，升级 `save_success` 单事务原子归并及 `query_by_file_id` / `query_by_certificate_key` / `query_files_by_certificate_key`，验证旧 7 字段库兼容与全量回滚。
-3. **字段提取与补丁/二阶段协同（`field_extractor.py`、`patches/no_review_layout_patch.py`、`two_stage_processor.py`、`main.py`）**：落地证号通栏分层提取、有效期双端点独立解析、新版无复审补丁同步及单止日免复核优化，并修正 `main.py` 动态字段数日志。
-4. **单元测试与快速/正式回归验证**：先跑 `uv run --with pytest pytest -v` 覆盖全部 9 字段与 FR-04/FR-05 边界用例，再用 `--fast` 跑通 `set1`/`set2` 快速验证，最后在独立正式库完成 18/18 及全集零回归验收。
+> 一期核心识别与复核流程、FR-04（证号提取与联合主键四表持久化）及 FR-05（有效期双端点独立解析）均已实施并验收完成。以下为本次新增需求 **FR-06 数据库表格导出** 的编码实施顺序（全程冻结 `file_scanner.py`、`ocr_engine.py`、`field_extractor.py`、`two_stage_processor.py` 与 `patches/`，保障既有识别零回归）：
+
+1. **项目依赖补充（`pyproject.toml`）**：在核心依赖中新增 `openpyxl>=3.1.0`（同步 `uv.lock`），满足 `uv run main.py -export` 开箱即用。
+2. **最小化配置与数据契约扩展（`config.py`、`models.py`）**：在 `config.py` 增补 `EXPORT_SHEET_NAME` 与 13 列 `EXPORT_HEADERS`；在 `models.py` 增补 `ExportRow` 与 `ExportSummary`。
+3. **只读快照导出查询实现（`data_repository.py`）**：新增静态方法 `DataRepository.query_export_rows_readonly(db_path)`，使用前置存在性检查 + SQLite URI `?mode=ro` + `PRAGMA query_only = ON` + 单读事务批量装配，兼容无 `certificate_files` 表的早期历史库。
+4. **独立表格导出模块实现（新增 `excel_exporter.py`）**：落地 `ExportError`、`derive_export_output_path`、13 列映射与关联回退、证号/日期纯文本安全写入（`@` 格式 + 非法 XML 控制符清洗 + 防公式解析）、0 条空表支持与临时文件原子替换落盘。
+5. **CLI 入口分流与延迟导入优化（`main.py`）**：新增 `-export`/`--export` 参数与参数互斥守卫（拒绝 `-export` 混传 `--fast`/`--input`），默认库固定为 `DEFAULT_DB_PATH`、按 `--db` 切换指定库；将 `OCREngine` 导入下沉至 `OCRProcessor._get_ocr_engine()` 内部，保证导出模式零视觉依赖秒级执行。
+6. **自动化单元测试与端到端实库验收（`tests/test_excel_exporter.py` + `prd2.md` 核对）**：编写覆盖全部 6 条验收场景及边界故障的自动化测试，执行 `uv run --with pytest pytest -v` 确认全量测试零回归；用 `--fast` 生成新测试库后实跑 `uv run main.py -export --db "./data/ocr_fast.db"` 与异常退出用例完成验收，验收通过后将 `prd/prd2.md` 状态更新为已完成。

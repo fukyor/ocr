@@ -141,3 +141,24 @@ class CertificateRecord:
     file_ids: List[str]  # 关联的全部源文件 file_id 列表（按关联时间升序）
     created_at: str  # 首次建档时间（ISO 8601）
     updated_at: str  # 最近关联更新时间（ISO 8601）
+
+
+@dataclass
+class ExportRow:
+    """FR-06 只读导出单行视图（严格限定为单份 files 记录及其本文件识别字段和可选证件关联）。"""
+
+    file_id: str  # 源文件唯一标识
+    file_name: str  # 原始文件名
+    file_path: str  # 规范化绝对路径
+    error_message: Optional[str] = None  # 失败或不支持原因
+    fields: FieldDict = field(default_factory=dict)  # 本文件识别字段（success 时为九键字典，其余为空）
+    certificate_key: Optional[CertificateKey] = None  # 证件联合主键（若已建立关联）
+
+
+@dataclass
+class ExportSummary:
+    """FR-06 导出完成后的结构化摘要。"""
+
+    db_path: str  # 实际读取的数据库路径
+    output_path: str  # 实际落盘的 .xlsx 工作簿路径
+    row_count: int  # 导出的数据行数（不含表头，0 条时为 0）
