@@ -8,6 +8,8 @@
 
 **工程准则**　最小化设计、准确度优先（错填为零）、文件可追溯、单文件异常隔离；能原位微调且不影响既有稳定性的直接微调，可能影响既有稳定性的严格解耦为独立补丁或独立模块。
 
+**Windows 交付状态（01～08 项已验收，待离线终验）**　已以 `main.py` 为控制台入口，通过独立 [packaging/ocr.spec](../packaging/ocr.spec) 与自动化测试 [tests/test_exe_packaging.py](../tests/test_exe_packaging.py) 生成 `dist\ocr\ocr.exe` 与 `dist\ocr-0.1.0-windows-x64.zip`（沿用全部参数、相对路径与退出码，业务源码零修改），详见第九章及 [Windows 命令行 EXE 打包计划](../plan/Windows命令行EXE打包计划.md)。
+
 ---
 
 ## 一、设计背景与核心问题分析
@@ -1491,3 +1493,60 @@ E:/D/zuoyewenjian/MyProject/ocr/
 | **#8** | 低 | `models.py:24-26` / `excel_exporter.py:344-365` / `main.py:75, 178` | `count_non_empty_fields` 未过滤纯空白串；`excel_exporter` 第 1～10 列宽上限被 `base_width` 锁死；`main.py` 的 `_file_content_cache` 写入后未读取且在部分早退分支未释放。 |
 | **#9** | 中（测试） | `tests/test_field_extractor.py`, `test_repository.py`, `test_pipeline.py`, `test_xie_pengfei.py`, `test_excel_exporter.py` | 既有 3 个核心测试文件仍停留在 7 字段与顶层 `OCREngine` 导入阶段，全量 `pytest` 会失败；`test_xie_pengfei.py` 为顶层推理脚本；FR-04/FR-05 自动化单测及 `test_excel_exporter.py` 的 5 项边界用例待补齐。 |
 | **#10** | 低（注释） | `field_extractor.py`, `main.py`, `README.md`, `pyproject.toml` | 部分源码注释与 `README.md` 仍残留“七个字段”旧描述；`pyproject.toml` 未显式声明直接导入的 `opencv-python` 与 `numpy`。 |
+
+---
+
+## 九、Windows 命令行 EXE 离线打包与验收架构（新增模块）
+
+为保证零侵入既有识别与导出逻辑，Windows EXE 交付完全与业务代码解耦，采用独立构建配置 [packaging/ocr.spec](../packaging/ocr.spec)（规避与根目录 `config.py` 同名冲突）、`pyproject.toml` 的 `build` 依赖组以及自动化验收套件 [tests/test_exe_packaging.py](../tests/test_exe_packaging.py)。
+
+### 9.1 构建与对照验收流程
+
+```mermaid
+flowchart LR
+    Env["uv.lock + build 依赖组 (PyInstaller 6.22.3)"] --> Spec["packaging/ocr.spec"]
+    Spec --> VerifyModel{"校验 4 个目标 ONNX\n存在且 SHA-256 匹配?"}
+    VerifyModel -- "否" --> Abort["打印具体缺失/失配文件并中止构建"]
+    VerifyModel -- "是" --> Analyze["Analysis(main.py)\n补齐 hiddenimports + 原生库 + MSVC 运行库\n排除 mupdf-devel 与未使用模型"]
+    Analyze --> Collect["EXE(console=True) + COLLECT(--onedir)"]
+    Collect --> Dist["dist/ocr/ (ocr.exe + _internal/)"]
+    Dist --> AutoTest["tests/test_exe_packaging.py\n产物校验 + 01~08 项源码/EXE 对照"]
+    AutoTest -- "9 passed (0 警告)" --> Zip["dist/ocr-0.1.0-windows-x64.zip"]
+    Zip --> Offline["独立干净离线 Windows x64 断网终验 (第 09 项)"]
+```
+
+### 9.2 核心模块伪代码（`packaging/ocr.spec`）
+
+```text
+function build_onedir_spec():
+    ROOT_DIR <- parent(SPECPATH)
+    RAPIDOCR_DIR <- parent(rapidocr.__file__)
+    manifest <- load_yaml(RAPIDOCR_DIR / "default_models.yaml")["onnxruntime"]
+
+    datas <- [(RAPIDOCR_DIR / "config.yaml", "rapidocr"),
+              (RAPIDOCR_DIR / "default_models.yaml", "rapidocr")]
+
+    for (ver, task, key, filename) in REQUIRED_4_MODELS:
+        model_path <- RAPIDOCR_DIR / "models" / filename
+        if not exists(model_path) or sha256(model_path) != manifest[ver][task][key]["SHA256"]:
+            abort_build_with_detail(model_path)
+        datas.append((model_path, "rapidocr/models"))
+
+    binaries <- collect_dynamic_libs("onnxruntime")
+              + collect_dynamic_libs("pymupdf")
+              + collect_system32_msvc_dlls("vcruntime140*.dll", "msvcp140*.dll")
+
+    analysis <- Analysis(
+        entry=ROOT_DIR / "main.py",
+        pathex=[ROOT_DIR],
+        binaries=binaries,
+        datas=datas,
+        hiddenimports=["rapidocr.main", "rapidocr.inference_engine.onnxruntime", "onnxruntime",
+                       "ocr_engine", "excel_exporter", "patches", "patches.no_review_layout_patch"],
+        excludes=["pytest", "torch", "paddle", "openvino", "tensorrt", "MNN", "pymupdf4llm", "pymupdf_layout"],
+    )
+    analysis.datas <- filter_out(analysis.datas, ["mupdf-devel", "pymupdf/layout/resources/onnx"])
+
+    exe <- EXE(PYZ(analysis.pure), analysis.scripts, exclude_binaries=True, name="ocr", console=True, upx=False)
+    COLLECT(exe, analysis.binaries, analysis.datas, name="ocr", upx=False)
+```
